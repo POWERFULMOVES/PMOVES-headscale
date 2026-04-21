@@ -1,69 +1,51 @@
-# PMOVES.AI Integration Guide for Headscale
+# PMOVES.AI Integration Dossier
 
-## Integration Overview
+_Last updated: 2026-04-21_
 
-Headscale is a self-hosted Tailscale control server that manages VPN mesh networks (tailnets) for PMOVES.AI infrastructure. It handles node registration, IP allocation, policy enforcement, DERP relay, and ACL rules across distributed deployment targets (ai-lab, kvm4, cloudstartup).
+## Module
+- Name: Headscale
+- Path: vendor/PMOVES-headscale (git submodule)
 
-## Service Details
+## Purpose in PMOVES.AI
+- Runtime: VPN mesh control plane (Tailscale-compatible self-hosted control server)
+- Provides: node management, auth key creation, route advertisement, ACL enforcement, DERP relay coordination
+- Fleet role: Exit Node tier (network edge)
 
-- **Name:** Headscale VPN Control Plane
-- **Slug:** headscale
-- **Tier:** agent
-- **Port:** 8096 (API), 9091 (Prometheus metrics)
-- **Health Check:** http://localhost:8096/healthz
-- **NATS Enabled:** False
-- **GPU Enabled:** False
+## PMOVES Overlay Surface
+- pmoves-integrations/ overlay path: N/A (config-driven, no code overlay)
+- Compose/profile wiring: pmoves/docker-compose.remote.yml (headscale service, profile: remote)
+- Standalone compose: pmoves/docker-compose.hostinger.yml (fork: pmoves/docker-compose.hostinger.yml)
+- Env/secret inputs: DOCKED_MODE, PARENT_SYSTEM, PARENT_VERSION (informational only)
+- Auth/JWT requirements: None (Headscale uses its own Noise protocol + pre-auth keys)
 
-## Integration Points
+## Contracts and Topics
+- NATS subjects: None (Headscale does not use NATS)
+- Supabase schema/tables touched: None directly (BoTZ VPN MCP writes session logs to Supabase)
+- MCP endpoints/skills: BoTZ VPN MCP (port 8110, SSE transport) — consumes Headscale REST API
 
-### VPN Mesh for Distributed Agents
-- Provides secure overlay network for multi-host agent orchestration
-- Mesh Agent (NATS announcer) uses Tailscale network for node discovery
-- CI runner lanes (ai-lab, kvm4, cloudstartup) connected via tailnet
+## Boot Order and Health
+- Bring-up dependency order: No dependencies (Headscale starts first on exit node VPS)
+- Health endpoints: GET /health (NOT /healthz — confirmed in hscontrol/app.go:523)
+- Smoke targets: Container healthy + API key created + ACL applied + admin user created
 
-### Infrastructure Connectivity
-```
-ai-lab host ──┐
-kvm4 host ────┤── Headscale Control ── Tailnet Mesh
-cloudstartup ─┘                        ├── Agent Zero
-                                       ├── Docker Services
-                                       └── CI Runners
-```
+## Hardening Notes
+- Image pinning / provenance: ghcr.io/juanfont/headscale:v0.28.0 (GHCR, upstream)
+- Secrets source: API key generated post-deploy via `headscale apikeys create`, stored in ce_memory_store
+- Network/security policy constraints:
+  - read_only: true (immutable filesystem)
+  - tmpfs: /var/run/headscale (unix socket — required with read_only)
+  - Config volume mounted :ro
+  - command: serve (REQUIRED)
+  - Distroless base image (no shell in non-debug variant)
 
-### Key APIs
-- `POST /api/v1/apikey` - Create API keys
-- `GET /api/v1/machines` - List registered nodes
-- ACL policy endpoints for access control
+## Source Documentation
+- Upstream docs entrypoint: README.md, docs/ directory
+- Upstream config reference: config-example.yaml (v0.28.0, 483 lines)
+- PMOVES config: pmoves/config.yaml (this fork)
+- PMOVES ACL: pmoves/acl.yaml (this fork)
+- PMOVES compose: pmoves/docker-compose.hostinger.yml (this fork)
+- PMOVES docs index reference: pmoves/docs/architecture/vpn-mesh-architecture.md
 
-### Database
-- SQLite (development) or PostgreSQL (production)
-
-## Next Steps
-
-### 1. Customize Environment Variables
-
-Edit the following files with your service-specific values:
-
-- `env.shared` - Base environment configuration
-- Headscale config: `config.yaml` with server URL, DERP settings, ACL policies
-
-### 2. Test Integration
-
-```bash
-# Test health check
-curl http://localhost:8096/healthz
-
-# Verify metrics endpoint
-curl http://localhost:9091/metrics
-
-# List registered nodes
-curl -H "Authorization: Bearer <API_KEY>" http://localhost:8096/api/v1/machines
-```
-
-## Files Created
-
-- `PMOVES.AI_INTEGRATION.md` - This integration guide
-
-## Support
-
-For questions or issues, see the PMOVES.AI documentation.
+## Owner / Audit
+- Owning lane: Networking / Infrastructure
+- Last integration audit run: 2026-04-21
