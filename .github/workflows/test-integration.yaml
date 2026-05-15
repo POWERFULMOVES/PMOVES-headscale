@@ -249,7 +249,10 @@ jobs:
           - TestTagsAuthKeyWithoutUserRejectsAdvertisedTags
           - TestTagsAuthKeyConvertToUserViaCLIRegister
     uses: ./.github/workflows/integration-test-template.yml
-    secrets: inherit
+    # F-04 FIX: Explicit secret passing — only Tailscale OAuth creds needed
+    secrets:
+      TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+      TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
     with:
       test: ${{ matrix.test }}
       postgres_flag: "--postgres=0"
@@ -267,7 +270,10 @@ jobs:
           - TestPingAllByIPManyUpDown
           - TestSubnetRouterMultiNetwork
     uses: ./.github/workflows/integration-test-template.yml
-    secrets: inherit
+    # F-04 FIX: Explicit secret passing — only Tailscale OAuth creds needed
+    secrets:
+      TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+      TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
     with:
       test: ${{ matrix.test }}
       postgres_flag: "--postgres=1"
