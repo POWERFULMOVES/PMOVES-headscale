@@ -13,6 +13,13 @@ on:
       database_name:
         required: true
         type: string
+    secrets:
+      TS_OAUTH_CLIENT_ID:
+        description: "Tailscale OAuth client ID for debug SSH access"
+        required: false
+      TS_OAUTH_SECRET:
+        description: "Tailscale OAuth secret for debug SSH access"
+        required: false
 
 jobs:
   test:
