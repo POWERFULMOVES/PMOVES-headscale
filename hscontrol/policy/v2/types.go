@@ -14,7 +14,6 @@ import (
 	"github.com/go-json-experiment/json"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
-	"github.com/prometheus/common/model"
 	"github.com/tailscale/hujson"
 	"go4.org/netipx"
 	"tailscale.com/net/tsaddr"
@@ -35,8 +34,6 @@ const Wildcard = Asterix(0)
 
 var ErrAutogroupSelfRequiresPerNodeResolution = errors.New("autogroup:self requires per-node resolution and cannot be resolved in this context")
 
-var ErrCircularReference = errors.New("circular reference detected")
-
 var ErrUndefinedTagReference = errors.New("references undefined tag")
 
 // SSH validation errors.
@@ -46,17 +43,25 @@ var (
 	ErrSSHAutogroupSelfRequiresUserSource = errors.New("autogroup:self destination requires source to contain only users or groups, not tags or autogroup:tagged")
 	ErrSSHTagSourceToAutogroupMember      = errors.New("tags in SSH source cannot access autogroup:member (user-owned devices)")
 	ErrSSHWildcardDestination             = errors.New("wildcard (*) is not supported as SSH destination")
-	ErrSSHCheckPeriodBelowMin             = errors.New("checkPeriod below minimum of 1 minute")
-	ErrSSHCheckPeriodAboveMax             = errors.New("checkPeriod above maximum of 168 hours (1 week)")
+	ErrSSHCheckPeriodAboveMax             = errors.New("is above the max (168h)")
+	ErrSSHCheckPeriodNegative             = errors.New("must be a positive duration")
 	ErrSSHCheckPeriodOnNonCheck           = errors.New("checkPeriod is only valid with action \"check\"")
 	ErrInvalidLocalpart                   = errors.New("invalid localpart format, must be localpart:*@<domain>")
+	ErrSSHUsersMustBeSpecified            = errors.New("users must be specified")
+	ErrSSHUserInvalid                     = errors.New("is not valid")
+	ErrSSHAcceptEnvEmpty                  = errors.New("acceptEnv values cannot be empty")
+	ErrSSHActionMustBeSpecified           = errors.New("action must be specified")
+	ErrSSHActionInvalid                   = errors.New("is not a valid action")
+	ErrSSHDestinationHostAlias            = errors.New("invalid dst")
+	ErrTagNameMustStartWithLetter         = errors.New("tag names must start with a letter, after 'tag:'")
+	ErrGroupMembersCannotBeRecursive      = errors.New("group members cannot be recursive")
 )
 
 // SSH check period constants per Tailscale docs:
 // https://tailscale.com/docs/features/tailscale-ssh#checkperiod
+// SaaS imposes no minimum (0s is accepted) so headscale matches.
 const (
 	SSHCheckPeriodDefault = 12 * time.Hour
-	SSHCheckPeriodMin     = time.Minute
 	SSHCheckPeriodMax     = 168 * time.Hour
 )
 
@@ -76,6 +81,26 @@ var (
 	ErrGrantAppWithAutogroupInternet   = errors.New("cannot use app grants with autogroup:internet")
 	ErrGrantDefaultRouteCIDR           = errors.New("to allow all IP addresses, use \"*\" or \"autogroup:internet\"")
 )
+
+// NodeAttrs validation errors.
+var (
+	ErrNodeAttrsIPPoolReserved      = errors.New("nodeAttrs ipPool must not overlap reserved Tailscale ranges")
+	ErrNodeAttrsIPPoolOutOfRange    = errors.New("nodeAttrs ipPool must be within 100.64.0.0/10")
+	ErrNodeAttrsAutogroupNotAllowed = errors.New("nodeAttrs target does not support this autogroup")
+	ErrNodeAttrUnsupported          = errors.New("nodeAttrs uses a feature headscale does not yet support")
+	ErrNodeAttrIPPoolUnsupported    = errors.New("nodeAttrs ipPool requires the IP allocator (https://github.com/juanfont/headscale/issues/2912)")
+	ErrNodeAttrTargetUnsupported    = errors.New("nodeAttrs target alias type is not supported")
+)
+
+// nodeAttrUnsupportedCaps lists caps that headscale parses but cannot act on
+// today. Each entry maps to the tracking issue an operator can follow. The
+// caps are accepted by Tailscale SaaS, but delivering them via headscale
+// without the matching server-side machinery would be misleading — nodes
+// would advertise a feature that does not work. Reject at policy load and
+// point operators at the issue.
+var nodeAttrUnsupportedCaps = map[tailcfg.NodeCapability]string{
+	tailcfg.NodeAttrFunnel: "https://github.com/juanfont/headscale/issues/2527",
+}
 
 // Policy validation errors.
 var (
@@ -100,7 +125,6 @@ var (
 	ErrGroupNotDefined             = errors.New("group not defined in policy")
 	ErrInvalidGroupMember          = errors.New("invalid group member type")
 	ErrGroupValueNotArray          = errors.New("group value must be an array of users")
-	ErrNestedGroups                = errors.New("nested groups are not allowed")
 	ErrInvalidHostIP               = errors.New("hostname contains invalid IP address")
 	ErrTagNotDefined               = errors.New("tag not found")
 	ErrAutoApproverNotAlias        = errors.New("auto approver is not an alias")
@@ -117,7 +141,6 @@ var (
 	ErrAutogroupDangerAllDst       = errors.New("cannot use autogroup:danger-all as a dst")
 	ErrAutogroupNotSupportedSSHSrc = errors.New("autogroup not supported for SSH sources")
 	ErrAutogroupNotSupportedSSHDst = errors.New("autogroup not supported for SSH destinations")
-	ErrAutogroupNotSupportedSSHUsr = errors.New("autogroup not supported for SSH user")
 	ErrHostNotDefined              = errors.New("host not defined in policy")
 	ErrSSHSourceAliasNotSupported  = errors.New("alias not supported for SSH source")
 	ErrSSHDestAliasNotSupported    = errors.New("alias not supported for SSH destination")
@@ -125,6 +148,15 @@ var (
 	ErrUnknownSSHSrcAlias          = errors.New("unknown SSH source alias type")
 	ErrUnknownField                = errors.New("unknown field")
 	ErrProtocolNoSpecificPorts     = errors.New("protocol does not support specific ports")
+	ErrTestEmptyAssertions         = errors.New("test entry must have at least one of \"accept\" or \"deny\"")
+	ErrTestProtocolNotAllowed      = errors.New("test protocol must be tcp, udp, sctp, or empty")
+	ErrTestDestinationMultiPort    = errors.New("test destination port must be a single port")
+	ErrTestDestinationCIDR         = errors.New("test destination must be a single host, not a CIDR range")
+	ErrAutogroupInternetTestDst    = errors.New("autogroup:internet not valid as a test destination")
+	ErrSSHTestEmptySrc             = errors.New("SSH tests entry must have a non-empty src")
+	ErrSSHTestEmptyDst             = errors.New("SSH tests entry must have at least one dst")
+	ErrSSHTestDstUnknownTag        = errors.New("SSH tests dst contains unknown tag")
+	ErrSSHTestDstDisallowedElement = errors.New("SSH tests dst contains disallowed element")
 )
 
 type resolved struct {
@@ -370,11 +402,12 @@ func (u *Username) CanBeAutoApprover() bool {
 	return true
 }
 
-// resolveUser attempts to find a user in the provided [types.Users] slice that matches the Username.
-// It prioritizes matching the ProviderIdentifier, and if not found, it falls back to matching the Email or Name.
+// resolveUser attempts to find a user in the provided [types.Users] slice that matches the [Username].
+// It prioritizes matching the [types.User.ProviderIdentifier], and if not found, it falls back to matching
+// the [types.User.Email] or [types.User.Name].
 // If no matching user is found, it returns an error indicating no user matching.
 // If multiple matching users are found, it returns an error indicating multiple users matching.
-// It returns the matched types.User and a nil error if exactly one match is found.
+// It returns the matched [types.User] and a nil error if exactly one match is found.
 func (u *Username) resolveUser(users types.Users) (types.User, error) {
 	var potentialUsers types.Users
 
@@ -514,12 +547,27 @@ func (g *Group) resolve(p *Policy, users types.Users, nodes views.Slice[types.No
 // Tag is a special string which is always prefixed with `tag:`.
 type Tag string
 
+// Validate enforces the `tag:` prefix and the SaaS rule that the
+// first character after the prefix is an ASCII letter ([A-Za-z]).
+// Subsequent characters may be ASCII letters, digits, hyphens, or
+// dots — those are checked by the existing alias parser elsewhere.
 func (t *Tag) Validate() error {
-	if isTag(string(*t)) {
-		return nil
+	s := string(*t)
+	if !isTag(s) {
+		return fmt.Errorf("%w, got: %q", ErrInvalidTagFormat, *t)
 	}
 
-	return fmt.Errorf("%w, got: %q", ErrInvalidTagFormat, *t)
+	rest := strings.TrimPrefix(s, "tag:")
+	if rest == "" {
+		return ErrTagNameMustStartWithLetter
+	}
+
+	first := rest[0]
+	if (first < 'a' || first > 'z') && (first < 'A' || first > 'Z') {
+		return ErrTagNameMustStartWithLetter
+	}
+
+	return nil
 }
 
 func (t *Tag) UnmarshalJSON(b []byte) error {
@@ -671,9 +719,9 @@ func (p *Prefix) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// Resolve resolves the Prefix to an IPSet. The IPSet will contain all the IP
-// addresses that the Prefix represents within Headscale. It is the product
-// of the Prefix and the Policy, Users, and Nodes.
+// Resolve resolves the [Prefix] to an [netipx.IPSet]. The [netipx.IPSet] will
+// contain all the IP addresses that the [Prefix] represents within Headscale.
+// It is the product of the [Prefix] and the [Policy], [types.Users], and [types.Nodes].
 //
 // See [Policy], [types.Users], and [types.Nodes] for more details.
 func (p *Prefix) Resolve(_ *Policy, _ types.Users, nodes views.Slice[types.NodeView]) (ResolvedAddresses, error) {
@@ -816,11 +864,17 @@ type Alias interface {
 	Validate() error
 	UnmarshalJSON(b []byte) error
 
-	// Resolve resolves the Alias to an IPSet. The IPSet will contain all the IP
-	// addresses that the Alias represents within Headscale. It is the product
-	// of the Alias and the Policy, Users and Nodes.
-	// This is an interface definition and the implementation is independent of
-	// the Alias type.
+	// String renders the alias back to its policy-file form. Implementations
+	// are expected to return a value that round-trips through [parseAlias] for
+	// any alias the parser accepted, so callers can use it as a stable
+	// identity in rendered errors and logs.
+	String() string
+
+	// Resolve resolves the [Alias] to a [netipx.IPSet]. The [netipx.IPSet] will
+	// contain all the IP addresses that the [Alias] represents within Headscale.
+	// It is the product of the [Alias] and the [Policy], [types.Users] and
+	// [types.Nodes]. This is an interface definition and the implementation is
+	// independent of the [Alias] type.
 	Resolve(pol *Policy, users types.Users, nodes views.Slice[types.NodeView]) (ResolvedAddresses, error)
 
 	resolve(pol *Policy, users types.Users, nodes views.Slice[types.NodeView]) (*netipx.IPSet, error)
@@ -1031,10 +1085,17 @@ func parseAlias(vs string) (Alias, error) {
 // AliasEnc is used to deserialize a Alias.
 type AliasEnc struct{ Alias }
 
+// UnmarshalJSON trims surrounding whitespace from each alias string
+// before dispatching so that `"tag:server "` or `" odin@example.com"`
+// resolves to the same tag or user SaaS would resolve. SaaS trims
+// before lookup; a literal-match policy here would drop the affected
+// node from every rule referencing it.
 func (ve *AliasEnc) UnmarshalJSON(b []byte) error {
 	ptr, err := unmarshalPointer(
 		b,
-		parseAlias,
+		func(s string) (Alias, error) {
+			return parseAlias(strings.TrimSpace(s))
+		},
 	)
 	if err != nil {
 		return err
@@ -1117,7 +1178,7 @@ func buildIPSetMultiErr(ipBuilder *netipx.IPSetBuilder, errs []error) (*netipx.I
 	return ips, multierr.New(append(errs, err)...)
 }
 
-// Helper function to unmarshal a JSON string into either an AutoApprover or Owner pointer.
+// Helper function to unmarshal a JSON string into either an [AutoApprover] or [Owner] pointer.
 func unmarshalPointer[T any](
 	b []byte,
 	parseFunc func(string) (T, error),
@@ -1289,7 +1350,7 @@ func parseOwner(s string) (Owner, error) {
 
 type Usernames []Username
 
-// Groups are a map of Group to a list of Username.
+// Groups are a map of [Group] to a list of [Username].
 type Groups map[Group]Usernames
 
 func (g *Groups) Contains(group *Group) error {
@@ -1306,8 +1367,8 @@ func (g *Groups) Contains(group *Group) error {
 	return fmt.Errorf("%w: %q", ErrGroupNotDefined, group)
 }
 
-// UnmarshalJSON overrides the default JSON unmarshalling for Groups to ensure
-// that each group name is validated using the isGroup function. This ensures
+// UnmarshalJSON overrides the default JSON unmarshalling for [Groups] to ensure
+// that each group name is validated using the [isGroup] function. This ensures
 // that all group names conform to the expected format, which is always prefixed
 // with "group:". If any group name is invalid, an error is returned.
 func (g *Groups) UnmarshalJSON(b []byte) error {
@@ -1354,6 +1415,25 @@ func (g *Groups) UnmarshalJSON(b []byte) error {
 		}
 	}
 
+	// Reject group-in-group references. Reverse-sort the keys so the
+	// reported (parent, child) pair names the deepest non-leaf parent
+	// first.
+	keys := make([]string, 0, len(rawGroups))
+	for k := range rawGroups {
+		keys = append(keys, k)
+	}
+
+	slices.Sort(keys)
+	slices.Reverse(keys)
+
+	for _, key := range keys {
+		for _, u := range rawGroups[key] {
+			if isGroup(u) {
+				return fmt.Errorf("groups[%q]: %q: %w", key, u, ErrGroupMembersCannotBeRecursive)
+			}
+		}
+	}
+
 	*g = make(Groups)
 
 	for key, value := range rawGroups {
@@ -1366,10 +1446,6 @@ func (g *Groups) UnmarshalJSON(b []byte) error {
 
 			err := username.Validate()
 			if err != nil {
-				if isGroup(u) {
-					return fmt.Errorf("%w: found %q inside %q", ErrNestedGroups, u, group)
-				}
-
 				return err
 			}
 
@@ -1466,7 +1542,7 @@ func (to TagOwners) MarshalJSON() ([]byte, error) {
 	return json.Marshal(rawTagOwners)
 }
 
-// TagOwners are a map of Tag to a list of the UserEntities that own the tag.
+// TagOwners are a map of [Tag] to a list of the UserEntities that own the tag.
 type TagOwners map[Tag]Owners
 
 func (to TagOwners) Contains(tagOwner *Tag) error {
@@ -1512,9 +1588,9 @@ func (ap AutoApproverPolicy) MarshalJSON() ([]byte, error) {
 	return json.Marshal(&obj)
 }
 
-// resolveAutoApprovers resolves the AutoApprovers to a map of netip.Prefix to netipx.IPSet.
+// resolveAutoApprovers resolves the [AutoApprovers] to a map of [netip.Prefix] to [netipx.IPSet].
 // The resulting map can be used to quickly look up if a node can self-approve a route.
-// It is intended for internal use in a PolicyManager.
+// It is intended for internal use in a [PolicyManager].
 func resolveAutoApprovers(p *Policy, users types.Users, nodes views.Slice[types.NodeView]) (map[netip.Prefix]*netipx.IPSet, *netipx.IPSet, error) {
 	if p == nil {
 		return nil, nil, nil
@@ -1578,14 +1654,14 @@ func resolveAutoApprovers(p *Policy, users types.Users, nodes views.Slice[types.
 	return ret, exitNodeSet, nil
 }
 
-// Action represents the action to take for an ACL rule.
+// Action represents the action to take for an [ACL] rule.
 type Action string
 
 const (
 	ActionAccept Action = "accept"
 )
 
-// SSHAction represents the action to take for an SSH rule.
+// SSHAction represents the action to take for an [SSH] rule.
 type SSHAction string
 
 const (
@@ -1593,12 +1669,12 @@ const (
 	SSHActionCheck  SSHAction = "check"
 )
 
-// String returns the string representation of the Action.
+// String returns the string representation of the [Action].
 func (a *Action) String() string {
 	return string(*a)
 }
 
-// UnmarshalJSON implements JSON unmarshaling for Action.
+// UnmarshalJSON implements JSON unmarshaling for [Action].
 func (a *Action) UnmarshalJSON(b []byte) error {
 	str := strings.Trim(string(b), `"`)
 	switch str {
@@ -1611,32 +1687,36 @@ func (a *Action) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// MarshalJSON implements JSON marshaling for Action.
+// MarshalJSON implements JSON marshaling for [Action].
 func (a *Action) MarshalJSON() ([]byte, error) {
 	return json.Marshal(string(*a))
 }
 
-// String returns the string representation of the SSHAction.
+// String returns the string representation of the [SSHAction].
 func (a *SSHAction) String() string {
 	return string(*a)
 }
 
-// UnmarshalJSON implements JSON unmarshaling for SSHAction.
+// UnmarshalJSON trims surrounding whitespace before matching, lets the
+// empty string through (per-rule Validate() surfaces it later), and
+// rejects every other unknown value here.
 func (a *SSHAction) UnmarshalJSON(b []byte) error {
-	str := strings.Trim(string(b), `"`)
+	str := strings.TrimSpace(strings.Trim(string(b), `"`))
 	switch str {
+	case "":
+		*a = SSHAction("")
 	case "accept":
 		*a = SSHActionAccept
 	case "check":
 		*a = SSHActionCheck
 	default:
-		return fmt.Errorf("%w: %q, must be one of: accept, check", ErrInvalidSSHAction, str)
+		return fmt.Errorf("%q %w", str, ErrSSHActionInvalid)
 	}
 
 	return nil
 }
 
-// MarshalJSON implements JSON marshaling for SSHAction.
+// MarshalJSON implements JSON marshaling for [SSHAction].
 func (a *SSHAction) MarshalJSON() ([]byte, error) {
 	return json.Marshal(string(*a))
 }
@@ -1662,12 +1742,12 @@ const (
 	ProtocolNameWildcard Protocol = "*"
 )
 
-// String returns the string representation of the Protocol.
+// String returns the string representation of the [Protocol].
 func (p *Protocol) String() string {
 	return string(*p)
 }
 
-// Description returns the human-readable description of the Protocol.
+// Description returns the human-readable description of the [Protocol].
 func (p *Protocol) Description() string {
 	switch *p {
 	case ProtocolNameICMP:
@@ -1705,8 +1785,8 @@ func (p *Protocol) Description() string {
 	}
 }
 
-// toIANAProtocolNumbers converts a Protocol to its IANA protocol numbers.
-// Since validation happens during UnmarshalJSON, this method should not fail for valid Protocol values.
+// toIANAProtocolNumbers converts a [Protocol] to its IANA protocol numbers.
+// Since validation happens during [Protocol.UnmarshalJSON], this method should not fail for valid [Protocol] values.
 func (p *Protocol) toIANAProtocolNumbers() []int {
 	switch *p {
 	case "":
@@ -1750,14 +1830,28 @@ func (p *Protocol) toIANAProtocolNumbers() []int {
 	}
 }
 
-// UnmarshalJSON implements JSON unmarshaling for Protocol.
+// UnmarshalJSON implements JSON unmarshaling for [Protocol].
+//
+// Tailscale accepts both named ("tcp") and numeric IANA ("6") forms.
+// Storing whichever form the user wrote leaves downstream code with
+// two equivalents to handle separately, and any consumer that
+// branches on the named form would silently mishandle the numeric
+// equivalent. Canonicalising to the named form here makes [Protocol]
+// hold one value post-parse — every downstream consumer sees the
+// same form regardless of what the user wrote.
 func (p *Protocol) UnmarshalJSON(b []byte) error {
 	str := strings.Trim(string(b), `"`)
 
 	// Normalize to lowercase for case-insensitive matching
 	*p = Protocol(strings.ToLower(str))
 
-	// Validate the protocol
+	num, atoiErr := strconv.Atoi(string(*p))
+	if atoiErr == nil && num >= 0 && num <= 255 {
+		if name, ok := ProtocolNumberToName[num]; ok {
+			*p = name
+		}
+	}
+
 	err := p.validate()
 	if err != nil {
 		return err
@@ -1766,7 +1860,7 @@ func (p *Protocol) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// validate checks if the Protocol is valid.
+// validate checks if the [Protocol] is valid.
 func (p *Protocol) validate() error {
 	switch *p {
 	case "", ProtocolNameICMP, ProtocolNameIGMP, ProtocolNameIPv4, ProtocolNameIPInIP,
@@ -1798,7 +1892,7 @@ func (p *Protocol) validate() error {
 	}
 }
 
-// MarshalJSON implements JSON marshaling for Protocol.
+// MarshalJSON implements JSON marshaling for [Protocol].
 func (p *Protocol) MarshalJSON() ([]byte, error) {
 	return json.Marshal(string(*p))
 }
@@ -1820,7 +1914,7 @@ const (
 	ProtocolFC       = 133 // Fibre Channel
 )
 
-// ProtocolNumberToName maps IANA protocol numbers to their protocol name strings.
+// ProtocolNumberToName maps IANA protocol numbers to their [Protocol] name strings.
 var ProtocolNumberToName = map[int]Protocol{
 	ProtocolICMP:     ProtocolNameICMP,
 	ProtocolIGMP:     ProtocolNameIGMP,
@@ -1844,7 +1938,7 @@ type ACL struct {
 	Destinations []AliasWithPorts `json:"dst"`
 }
 
-// UnmarshalJSON implements custom unmarshalling for ACL that ignores fields starting with '#'.
+// UnmarshalJSON implements custom unmarshalling for [ACL] that ignores fields starting with '#'.
 // headscale-admin uses # in some field names to add metadata, so we will ignore
 // those to ensure it doesnt break.
 // https://github.com/GoodiesHQ/headscale-admin/blob/214a44a9c15c92d2b42383f131b51df10c84017c/src/lib/common/acl.svelte.ts#L38
@@ -1898,7 +1992,20 @@ type Grant struct {
 	Via []Tag `json:"via,omitzero"`
 }
 
-// aclToGrants converts an ACL rule to one or more equivalent Grant rules.
+// NodeAttrGrant attaches Tailscale node capabilities (and/or an IP-pool
+// preference) to every node selected by Targets. The Targets aliases are
+// resolved exactly like ACL/grant sources, so users, groups, tags, hosts,
+// prefixes, autogroup:member, autogroup:tagged, and "*" are all valid.
+//
+// IPPool is parsed and validated for forward compatibility with the IP
+// allocator; the policy compiler does not consume it yet.
+type NodeAttrGrant struct {
+	Targets Aliases                  `json:"target"`
+	Attrs   []tailcfg.NodeCapability `json:"attr,omitempty"`
+	IPPool  []netip.Prefix           `json:"ipPool,omitempty"`
+}
+
+// aclToGrants converts an [ACL] rule to one or more equivalent [Grant] rules.
 func aclToGrants(acl ACL) []Grant {
 	ret := make([]Grant, 0, len(acl.Destinations))
 
@@ -1970,8 +2077,8 @@ func aclToGrants(acl ACL) []Grant {
 // TODO(kradalby):
 // Add validation method checking:
 // All users exists
-// All groups and users are valid tag TagOwners
-// Everything referred to in ACLs exists in other
+// All groups and users are valid tag [TagOwners]
+// Everything referred to in [ACL]s exists in other
 // entities.
 type Policy struct {
 	// validated is set if the policy has been validated.
@@ -1979,16 +2086,20 @@ type Policy struct {
 	// callers using it should panic if not
 	validated bool `json:"-"`
 
-	Groups        Groups             `json:"groups,omitempty"`
-	Hosts         Hosts              `json:"hosts,omitempty"`
-	TagOwners     TagOwners          `json:"tagOwners,omitempty"`
-	ACLs          []ACL              `json:"acls,omitempty"`
-	Grants        []Grant            `json:"grants,omitempty"`
-	AutoApprovers AutoApproverPolicy `json:"autoApprovers"`
-	SSHs          []SSH              `json:"ssh,omitempty"`
+	Groups              Groups             `json:"groups,omitempty"`
+	Hosts               Hosts              `json:"hosts,omitempty"`
+	TagOwners           TagOwners          `json:"tagOwners,omitempty"`
+	ACLs                []ACL              `json:"acls,omitempty"`
+	Grants              []Grant            `json:"grants,omitempty"`
+	NodeAttrs           []NodeAttrGrant    `json:"nodeAttrs,omitempty"`
+	AutoApprovers       AutoApproverPolicy `json:"autoApprovers"`
+	SSHs                []SSH              `json:"ssh,omitempty"`
+	Tests               []PolicyTest       `json:"tests,omitempty"`
+	SSHTests            []SSHPolicyTest    `json:"sshTests,omitempty"`
+	RandomizeClientPort bool               `json:"randomizeClientPort,omitempty"`
 }
 
-// MarshalJSON is deliberately not implemented for Policy.
+// MarshalJSON is deliberately not implemented for [Policy].
 // We use the default JSON marshalling behavior provided by the Go runtime.
 
 var (
@@ -1997,11 +2108,23 @@ var (
 	autogroupForDst       = []AutoGroup{AutoGroupInternet, AutoGroupMember, AutoGroupTagged, AutoGroupSelf}
 	autogroupForSSHSrc    = []AutoGroup{AutoGroupMember, AutoGroupTagged}
 	autogroupForSSHDst    = []AutoGroup{AutoGroupMember, AutoGroupTagged, AutoGroupSelf}
-	autogroupForSSHUser   = []AutoGroup{AutoGroupNonRoot}
+	autogroupForNodeAttrs = []AutoGroup{AutoGroupMember, AutoGroupTagged}
 	autogroupNotSupported = []AutoGroup{}
 
 	errUnknownProtocolWildcard = errors.New("proto name \"*\" not known; use protocol number 0-255 or protocol name (icmp, tcp, udp, etc.)")
 )
+
+// reservedTSRanges are CGNAT subranges that Tailscale uses internally and that
+// nodeAttrs ipPool entries must not overlap.
+//
+//   - 100.100.100.0/24 is MagicDNS / TSMP
+//   - 100.115.92.0/23 is the Quad100 / IPN service range
+//
+// (See https://tailscale.com/kb/1304/ip-pool for the operator-facing list.)
+var reservedTSRanges = []netip.Prefix{
+	netip.MustParsePrefix("100.100.100.0/24"),
+	netip.MustParsePrefix("100.115.92.0/23"),
+}
 
 func validateAutogroupSupported(ag *AutoGroup) error {
 	if ag == nil {
@@ -2051,6 +2174,47 @@ func validateAutogroupForDst(dst *AutoGroup) error {
 	return nil
 }
 
+// validateAutogroupForNodeAttrs accepts only the autogroups that make sense
+// as a nodeAttrs target: autogroup:member and autogroup:tagged.
+// autogroup:self / autogroup:internet / autogroup:danger-all are rejected —
+// none of them describes a stable identity set that a node-level attribute
+// can attach to. autogroup:admin / autogroup:owner are rejected one layer
+// up: [AutoGroup.UnmarshalJSON] returns [ErrInvalidAutogroup] at parse time
+// because those values aren't in the allowed set, so the policy never
+// reaches this validator.
+func validateAutogroupForNodeAttrs(ag *AutoGroup) error {
+	if ag == nil {
+		return nil
+	}
+
+	if !slices.Contains(autogroupForNodeAttrs, *ag) {
+		return fmt.Errorf("%w: %q, can be %v", ErrNodeAttrsAutogroupNotAllowed, *ag, autogroupForNodeAttrs)
+	}
+
+	return nil
+}
+
+// validateNodeAttrIPPool rejects ipPool entries outside the CGNAT range or
+// overlapping the Tailscale-reserved subranges (MagicDNS, Quad100/IPN). A
+// [netip.Prefix] is considered "within" CGNAT when it is at least as specific as
+// 100.64.0.0/10 and its first address lies inside it.
+func validateNodeAttrIPPool(prefix netip.Prefix) error {
+	cgnat := tsaddr.CGNATRange()
+	masked := prefix.Masked()
+
+	if masked.Bits() < cgnat.Bits() || !cgnat.Contains(masked.Addr()) {
+		return fmt.Errorf("%w: %q", ErrNodeAttrsIPPoolOutOfRange, prefix)
+	}
+
+	for _, reserved := range reservedTSRanges {
+		if masked.Overlaps(reserved) {
+			return fmt.Errorf("%w: %q overlaps %q", ErrNodeAttrsIPPoolReserved, prefix, reserved)
+		}
+	}
+
+	return nil
+}
+
 func validateAutogroupForSSHSrc(src *AutoGroup) error {
 	if src == nil {
 		return nil
@@ -2083,23 +2247,11 @@ func validateAutogroupForSSHDst(dst *AutoGroup) error {
 	return nil
 }
 
-func validateAutogroupForSSHUser(user *AutoGroup) error {
-	if user == nil {
-		return nil
-	}
-
-	if !slices.Contains(autogroupForSSHUser, *user) {
-		return fmt.Errorf("%w: %q, can be %v", ErrAutogroupNotSupportedSSHUsr, *user, autogroupForSSHUser)
-	}
-
-	return nil
-}
-
 // validateSSHSrcDstCombination validates that SSH source/destination combinations
 // follow Tailscale's security model:
-// - Destination can be: tags, autogroup:self (if source is users/groups), or same-user
-// - Tags/autogroup:tagged CANNOT SSH to user destinations
-// - Username destinations require the source to be that same single user only.
+//   - Destination can be: tags, autogroup:self (if source is users/groups), or same-user
+//   - Tags/autogroup:tagged CANNOT SSH to user destinations
+//   - [Username] destinations require the source to be that same single user only.
 func validateSSHSrcDstCombination(sources SSHSrcAliases, destinations SSHDstAliases) error {
 	// Categorize source types
 	srcHasTaggedEntities := false
@@ -2152,11 +2304,11 @@ func validateSSHSrcDstCombination(sources SSHSrcAliases, destinations SSHDstAlia
 	return nil
 }
 
-// validateACLSrcDstCombination validates that ACL source/destination combinations
+// validateACLSrcDstCombination validates that [ACL] source/destination combinations
 // follow Tailscale's security model:
-// - autogroup:self destinations require ALL sources to be users, groups, autogroup:member, or wildcard (*)
-// - Tags, autogroup:tagged, hosts, and raw IPs are NOT valid sources for autogroup:self
-// - Wildcard (*) is allowed because autogroup:self evaluation narrows it per-node to the node's own IPs.
+//   - autogroup:self destinations require ALL sources to be users, groups, autogroup:member, or wildcard (*)
+//   - Tags, autogroup:tagged, hosts, and raw IPs are NOT valid sources for autogroup:self
+//   - Wildcard (*) is allowed because autogroup:self evaluation narrows it per-node to the node's own IPs.
 func validateACLSrcDstCombination(sources Aliases, destinations []AliasWithPorts) error {
 	// Check if any destination is autogroup:self
 	hasAutogroupSelf := false
@@ -2230,11 +2382,11 @@ var tailscaleCapAllowlist = map[tailcfg.PeerCapability]bool{
 	tailcfg.PeerCapabilityTsIDP:      true, // tailscale.com/cap/tsidp
 }
 
-// validateGrantSrcDstCombination validates grant-specific source/destination
-// combinations. Grants are stricter than ACLs: wildcard (*) sources are NOT
+// validateGrantSrcDstCombination validates [Grant]-specific source/destination
+// combinations. [Grant]s are stricter than [ACL]s: wildcard (*) sources are NOT
 // allowed with autogroup:self destinations because * includes tags, and tags
-// cannot use autogroup:self. ACLs allow this combination because ACL
-// autogroup:self evaluation narrows it per-node, but grants reject it at
+// cannot use autogroup:self. [ACL]s allow this combination because ACL
+// autogroup:self evaluation narrows it per-node, but [Grant]s reject it at
 // validation time.
 func validateGrantSrcDstCombination(sources Aliases, destinations Aliases) error {
 	hasAutogroupSelf := false
@@ -2370,23 +2522,29 @@ func (p *Policy) validate() error {
 	}
 
 	for _, ssh := range p.SSHs {
+		// Empty action and users survive parse; surface them here.
+		if ssh.Action == "" {
+			errs = append(errs, ErrSSHActionMustBeSpecified)
+		}
+
+		if len(ssh.Users) == 0 {
+			errs = append(errs, ErrSSHUsersMustBeSpecified)
+		}
+
+		// "" and "*" are not valid login users; any other string
+		// (including autogroup, group, tag, malformed localpart) is
+		// treated as a literal user name.
 		for _, user := range ssh.Users {
-			if strings.HasPrefix(string(user), "autogroup:") {
-				maybeAuto := AutoGroup(user)
-
-				err := validateAutogroupForSSHUser(&maybeAuto)
-				if err != nil {
-					errs = append(errs, err)
-					continue
-				}
+			switch user {
+			case "", "*":
+				errs = append(errs, fmt.Errorf("user %q %w", user, ErrSSHUserInvalid))
 			}
+		}
 
-			if user.IsLocalpart() {
-				_, err := user.ParseLocalpart()
-				if err != nil {
-					errs = append(errs, err)
-					continue
-				}
+		// acceptEnv entries cannot be empty; "*" and "**" are valid.
+		for _, env := range ssh.AcceptEnv {
+			if env == "" {
+				errs = append(errs, ErrSSHAcceptEnvEmpty)
 			}
 		}
 
@@ -2446,6 +2604,10 @@ func (p *Policy) validate() error {
 				if err != nil {
 					errs = append(errs, err)
 				}
+			case *Host:
+				// Hosts-table aliases are valid on ACL dst but
+				// rejected here for SSH dst.
+				errs = append(errs, fmt.Errorf("%w %q", ErrSSHDestinationHostAlias, string(*dst)))
 			}
 		}
 
@@ -2608,6 +2770,68 @@ func (p *Policy) validate() error {
 		}
 	}
 
+	for _, na := range p.NodeAttrs {
+		// SaaS accepts entries with neither attr nor ipPool (they
+		// compile to a no-op); headscale follows suit so policies
+		// captured against SaaS round-trip cleanly.
+		for _, target := range na.Targets {
+			switch t := target.(type) {
+			case *Host:
+				if !p.Hosts.exist(*t) {
+					errs = append(errs, fmt.Errorf("%w: %q", ErrHostNotDefined, *t))
+				}
+			case *AutoGroup:
+				err := validateAutogroupSupported(t)
+				if err != nil {
+					errs = append(errs, err)
+
+					continue
+				}
+
+				err = validateAutogroupForNodeAttrs(t)
+				if err != nil {
+					errs = append(errs, err)
+				}
+			case *Group:
+				err := p.Groups.Contains(t)
+				if err != nil {
+					errs = append(errs, err)
+				}
+			case *Tag:
+				err := p.TagOwners.Contains(t)
+				if err != nil {
+					errs = append(errs, err)
+				}
+			case *Username, *Prefix, Asterix:
+				// User / prefix / wildcard targets are accepted at
+				// parse time and resolved at compile time (where a
+				// typo'd username surfaces as a propagated Resolve
+				// error from compileNodeAttrs). Mirrors the grant
+				// source-side validation shape.
+			default:
+				errs = append(errs, fmt.Errorf("%w: %q (%T)", ErrNodeAttrTargetUnsupported, target, target))
+			}
+		}
+
+		for _, attr := range na.Attrs {
+			issue, ok := nodeAttrUnsupportedCaps[attr]
+			if ok {
+				errs = append(errs, fmt.Errorf("%w: %q tracked in %s", ErrNodeAttrUnsupported, attr, issue))
+			}
+		}
+
+		if len(na.IPPool) > 0 {
+			errs = append(errs, ErrNodeAttrIPPoolUnsupported)
+		}
+
+		for _, prefix := range na.IPPool {
+			err := validateNodeAttrIPPool(prefix)
+			if err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+
 	for _, tagOwners := range p.TagOwners {
 		for _, tagOwner := range tagOwners {
 			switch tagOwner := tagOwner.(type) {
@@ -2675,6 +2899,14 @@ func (p *Policy) validate() error {
 		}
 	}
 
+	if err := validateTests(p, p.Tests); err != nil { //nolint:noinlineerr
+		errs = append(errs, err)
+	}
+
+	if err := validateSSHTests(p, p.SSHTests); err != nil { //nolint:noinlineerr
+		errs = append(errs, err)
+	}
+
 	if len(errs) > 0 {
 		return multierr.New(errs...)
 	}
@@ -2686,14 +2918,14 @@ func (p *Policy) validate() error {
 
 // SSHCheckPeriod represents the check period for SSH "check" mode rules.
 // nil means not specified (runtime default of 12h applies).
-// Always=true means "always" (check on every request).
-// Duration is an explicit period (min 1m, max 168h).
+// [SSHCheckPeriod.Always]=true means "always" (check on every request).
+// [SSHCheckPeriod.Duration] is an explicit period (min 1m, max 168h).
 type SSHCheckPeriod struct {
 	Always   bool
 	Duration time.Duration
 }
 
-// UnmarshalJSON implements JSON unmarshaling for SSHCheckPeriod.
+// UnmarshalJSON implements JSON unmarshaling for [SSHCheckPeriod].
 func (p *SSHCheckPeriod) UnmarshalJSON(b []byte) error {
 	str := strings.Trim(string(b), `"`)
 	if str == "always" {
@@ -2702,17 +2934,17 @@ func (p *SSHCheckPeriod) UnmarshalJSON(b []byte) error {
 		return nil
 	}
 
-	d, err := model.ParseDuration(str)
+	d, err := time.ParseDuration(str)
 	if err != nil {
-		return fmt.Errorf("parsing checkPeriod %q: %w", str, err)
+		return err
 	}
 
-	p.Duration = time.Duration(d)
+	p.Duration = d
 
 	return nil
 }
 
-// MarshalJSON implements JSON marshaling for SSHCheckPeriod.
+// MarshalJSON implements JSON marshaling for [SSHCheckPeriod].
 func (p SSHCheckPeriod) MarshalJSON() ([]byte, error) {
 	if p.Always {
 		return []byte(`"always"`), nil
@@ -2721,26 +2953,19 @@ func (p SSHCheckPeriod) MarshalJSON() ([]byte, error) {
 	return fmt.Appendf(nil, "%q", p.Duration.String()), nil
 }
 
-// Validate checks that the SSHCheckPeriod is within allowed bounds.
+// Validate rejects negative durations and anything above the inclusive
+// 168h max.
 func (p *SSHCheckPeriod) Validate() error {
 	if p.Always {
 		return nil
 	}
 
-	if p.Duration < SSHCheckPeriodMin {
-		return fmt.Errorf(
-			"%w: got %s",
-			ErrSSHCheckPeriodBelowMin,
-			p.Duration,
-		)
+	if p.Duration < 0 {
+		return fmt.Errorf("checkPeriod %s %w", p.Duration, ErrSSHCheckPeriodNegative)
 	}
 
 	if p.Duration > SSHCheckPeriodMax {
-		return fmt.Errorf(
-			"%w: got %s",
-			ErrSSHCheckPeriodAboveMax,
-			p.Duration,
-		)
+		return fmt.Errorf("checkPeriod %s %w", p.Duration, ErrSSHCheckPeriodAboveMax)
 	}
 
 	return nil
@@ -2756,11 +2981,11 @@ type SSH struct {
 	AcceptEnv    []string        `json:"acceptEnv,omitempty"`
 }
 
-// SSHSrcAliases is a list of aliases that can be used as sources in an SSH rule.
+// SSHSrcAliases is a list of aliases that can be used as sources in an [SSH] rule.
 // It can be a list of usernames, groups, tags or autogroups.
 type SSHSrcAliases []Alias
 
-// MarshalJSON marshals the Groups to JSON.
+// MarshalJSON marshals the [Groups] to JSON.
 func (g *Groups) MarshalJSON() ([]byte, error) {
 	if *g == nil {
 		return []byte("{}"), nil
@@ -2825,7 +3050,7 @@ func (a *SSHDstAliases) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// MarshalJSON marshals the SSHDstAliases to JSON.
+// MarshalJSON marshals the [SSHDstAliases] to JSON.
 func (a SSHDstAliases) MarshalJSON() ([]byte, error) {
 	if a == nil {
 		return []byte("[]"), nil
@@ -2854,7 +3079,7 @@ func (a SSHDstAliases) MarshalJSON() ([]byte, error) {
 	return json.Marshal(aliases)
 }
 
-// MarshalJSON marshals the SSHSrcAliases to JSON.
+// MarshalJSON marshals the [SSHSrcAliases] to JSON.
 func (a *SSHSrcAliases) MarshalJSON() ([]byte, error) {
 	if a == nil || *a == nil {
 		return []byte("[]"), nil
@@ -2899,7 +3124,7 @@ func (a *SSHSrcAliases) Resolve(p *Policy, users types.Users, nodes views.Slice[
 	return newResolvedAddresses(buildIPSetMultiErr(&ips, errs))
 }
 
-// SSHDstAliases is a list of aliases that can be used as destinations in an SSH rule.
+// SSHDstAliases is a list of aliases that can be used as destinations in an [SSH] rule.
 // It can be a list of usernames, tags or autogroups.
 type SSHDstAliases []Alias
 
@@ -2918,37 +3143,57 @@ func (u SSHUsers) ContainsNonRoot() bool {
 	return slices.Contains(u, SSHUser(AutoGroupNonRoot))
 }
 
-// ContainsLocalpart returns true if any entry has the localpart: prefix.
+// ContainsLocalpart returns true if any entry is a canonical
+// `localpart:*@<domain>` form. Non-canonical strings starting with
+// `localpart:` are treated as literal usernames.
 func (u SSHUsers) ContainsLocalpart() bool {
 	return slices.ContainsFunc(u, func(user SSHUser) bool {
-		return user.IsLocalpart()
+		return user.IsCanonicalLocalpart()
 	})
 }
 
-// NormalUsers returns all SSH users that are not root, autogroup:nonroot,
-// or localpart: entries.
+// NormalUsers returns users that land in the compiled literal user map
+// (everything except root, autogroup:nonroot, and canonical
+// `localpart:*@<domain>`). Malformed `localpart:` strings stay here as
+// literals.
 func (u SSHUsers) NormalUsers() []SSHUser {
 	return slicesx.Filter(nil, u, func(user SSHUser) bool {
-		return user != "root" && user != SSHUser(AutoGroupNonRoot) && !user.IsLocalpart()
+		return user != "root" && user != SSHUser(AutoGroupNonRoot) && !user.IsCanonicalLocalpart()
 	})
 }
 
-// LocalpartEntries returns only the localpart: prefixed entries.
+// LocalpartEntries returns only canonical `localpart:*@<domain>` entries.
+// Non-canonical localpart strings are excluded so they do not trigger
+// the resolution path; they are emitted literally by NormalUsers.
 func (u SSHUsers) LocalpartEntries() []SSHUser {
 	return slicesx.Filter(nil, u, func(user SSHUser) bool {
-		return user.IsLocalpart()
+		return user.IsCanonicalLocalpart()
 	})
 }
 
-type SSHUser string
+type SSHUser string //nolint:recvcheck // UnmarshalJSON requires pointer receiver; string-newtype methods use value receivers by convention
 
 func (u SSHUser) String() string {
 	return string(u)
 }
 
-// IsLocalpart returns true if the SSHUser has the localpart: prefix.
+// IsLocalpart returns true if the [SSHUser] has the literal `localpart:`
+// prefix. It is a syntactic check only — non-canonical shapes still
+// pass.
 func (u SSHUser) IsLocalpart() bool {
 	return strings.HasPrefix(string(u), SSHUserLocalpartPrefix)
+}
+
+// IsCanonicalLocalpart reports whether the [SSHUser] parses as the
+// canonical `localpart:*@<domain>` form that resolution acts on.
+func (u SSHUser) IsCanonicalLocalpart() bool {
+	if !u.IsLocalpart() {
+		return false
+	}
+
+	_, err := u.ParseLocalpart()
+
+	return err == nil
 }
 
 // ParseLocalpart validates and extracts the domain from a localpart: entry.
@@ -2981,12 +3226,26 @@ func (u SSHUser) ParseLocalpart() (string, error) {
 	return domain, nil
 }
 
-// MarshalJSON marshals the SSHUser to JSON.
+// MarshalJSON marshals the [SSHUser] to JSON.
 func (u SSHUser) MarshalJSON() ([]byte, error) {
 	return json.Marshal(string(u))
 }
 
-// unmarshalPolicy takes a byte slice and unmarshals it into a Policy struct.
+// UnmarshalJSON trims surrounding whitespace per element. A whitespace-
+// only entry collapses to `""` and surfaces as `user "" is not valid` in
+// the per-rule [Policy.validate] pass.
+func (u *SSHUser) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil { //nolint:noinlineerr
+		return err
+	}
+
+	*u = SSHUser(strings.TrimSpace(s))
+
+	return nil
+}
+
+// unmarshalPolicy takes a byte slice and unmarshals it into a [Policy] struct.
 // In addition to unmarshalling, it will also validate the policy.
 // This is the only entrypoint of reading a policy from a file or other source.
 func unmarshalPolicy(b []byte) (*Policy, error) {
@@ -3013,9 +3272,18 @@ func unmarshalPolicy(b []byte) (*Policy, error) {
 			}
 
 			// Non-tag entries in grant.via surface as type errors on
-			// []Tag; match SaaS wording instead of Go's JSON diagnostic.
+			// []Tag; rephrase to the wire-compatible body.
 			if strings.Contains(string(serr.JSONPointer), "/via/") {
 				return nil, ErrGrantViaNotATag
+			}
+
+			// Non-ASCII tag-name failures surface from Tag.Validate
+			// at unmarshal time. Reshape to `tagOwners["tag:X"]: …`.
+			if errors.Is(serr.Err, ErrTagNameMustStartWithLetter) {
+				ptr := serr.JSONPointer
+				name := ptr.LastToken()
+
+				return nil, fmt.Errorf("tagOwners[%q]: %w", name, ErrTagNameMustStartWithLetter)
 			}
 		}
 
@@ -3029,8 +3297,8 @@ func unmarshalPolicy(b []byte) (*Policy, error) {
 	return &policy, nil
 }
 
-// validateProtocolPortCompatibility checks that only TCP, UDP, and SCTP protocols
-// can have specific ports. All other protocols should only use wildcard ports.
+// validateProtocolPortCompatibility checks that only TCP, UDP, and SCTP [Protocol]s
+// can have specific ports. All other [Protocol]s should only use wildcard ports.
 func validateProtocolPortCompatibility(protocol Protocol, destinations []AliasWithPorts) error {
 	// Only TCP, UDP, and SCTP support specific ports
 	supportsSpecificPorts := protocol == ProtocolNameTCP || protocol == ProtocolNameUDP || protocol == ProtocolNameSCTP || protocol == ""
@@ -3046,6 +3314,181 @@ func validateProtocolPortCompatibility(protocol Protocol, destinations []AliasWi
 			if portRange.First != 0 || portRange.Last != 65535 {
 				return fmt.Errorf("%w: %q, only \"*\" is allowed", ErrProtocolNoSpecificPorts, protocol)
 			}
+		}
+	}
+
+	return nil
+}
+
+// validateTests enforces the four shape rules a tests-block entry must
+// follow: a tests entry describes one connection attempt to one specific
+// destination port over a connection-oriented protocol and asserts
+// whether that attempt is allowed or denied. The same shapes remain
+// valid inside [ACL] or [Grant] destinations where the rule does not apply.
+func validateTests(pol *Policy, tests []PolicyTest) error {
+	var errs []error
+
+	for i, t := range tests {
+		if len(t.Accept) == 0 && len(t.Deny) == 0 {
+			errs = append(errs, fmt.Errorf("test %d: %w", i, ErrTestEmptyAssertions))
+		}
+
+		if t.Proto != "" &&
+			t.Proto != ProtocolNameTCP &&
+			t.Proto != ProtocolNameUDP &&
+			t.Proto != ProtocolNameSCTP {
+			errs = append(errs, fmt.Errorf("test %d: %w: %q", i, ErrTestProtocolNotAllowed, t.Proto))
+		}
+
+		for _, dst := range t.Accept {
+			err := validateTestDestination(pol, dst)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("test %d, accept %q: %w", i, dst, err))
+			}
+		}
+
+		for _, dst := range t.Deny {
+			err := validateTestDestination(pol, dst)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("test %d, deny %q: %w", i, dst, err))
+			}
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("%w:\n%w", errPolicyTestsFailed, multierr.New(errs...))
+	}
+
+	return nil
+}
+
+// validateTestDestination enforces that a tests-block dst describes one
+// connection attempt to one specific host on one specific port. SaaS
+// rejects three shapes that violate the rule: autogroup:internet (routed
+// by exit-node [tailcfg.Node.AllowedIPs], not the packet filter); multi-port
+// (range/list/wildcard, no single allow/deny answer); and CIDR ranges
+// — both raw `/N` syntax and `hosts:`-table aliases whose RHS is a
+// multi-host prefix. Bare IP literals reach this function as *[Prefix]
+// /32 or /128 just like explicit `/32` / `/128` does, so the CIDR
+// check inspects the raw input string for `/` rather than the parsed
+// alias type.
+func validateTestDestination(pol *Policy, dst string) error {
+	awp, err := parseDestinationAlias(dst)
+	if err != nil {
+		return err
+	}
+
+	if ag, ok := awp.Alias.(*AutoGroup); ok && *ag == AutoGroupInternet {
+		return ErrAutogroupInternetTestDst
+	}
+
+	if len(awp.Ports) != 1 || awp.Ports[0].First != awp.Ports[0].Last {
+		return ErrTestDestinationMultiPort
+	}
+
+	if _, isPrefix := awp.Alias.(*Prefix); isPrefix && strings.Contains(dst, "/") {
+		return ErrTestDestinationCIDR
+	}
+
+	if h, isHost := awp.Alias.(*Host); isHost && pol != nil {
+		if pref, ok := pol.Hosts[*h]; ok {
+			p := netip.Prefix(pref)
+			if p.Bits() < p.Addr().BitLen() {
+				return ErrTestDestinationCIDR
+			}
+		}
+	}
+
+	return nil
+}
+
+// validateSSHTests enforces parse-time shape on every sshTests entry:
+// non-empty src, at least one dst, and each dst describing a single
+// SSH-reachable host. Login-user assertions land with the engine so
+// failures surface through the same errSSHPolicyTestsFailed wrapper.
+func validateSSHTests(pol *Policy, tests []SSHPolicyTest) error {
+	var errs []error
+
+	for i, t := range tests {
+		if t.Src == nil {
+			errs = append(errs, fmt.Errorf("sshTest %d: %w", i, ErrSSHTestEmptySrc))
+		}
+
+		if len(t.Dst) == 0 {
+			errs = append(errs, fmt.Errorf("sshTest %d: %w", i, ErrSSHTestEmptyDst))
+		}
+
+		for _, dst := range t.Dst {
+			err := validateSSHTestDestination(pol, dst)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("sshTest %d: %w", i, err))
+			}
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("%w:\n%w", errSSHPolicyTestsFailed, multierr.New(errs...))
+	}
+
+	return nil
+}
+
+// validateSSHTestDestination rejects sshTests dst shapes that cannot
+// name a single SSH-reachable host:
+//
+//   - `host:port` suffixes (parsed as an unknown tag),
+//   - multi-host CIDRs (raw `/N` or a hosts: entry resolving wider),
+//   - autogroup:internet (valid as ACL dst only).
+//
+// A bare IP literal (single-host /BitLen prefix) is accepted. Tag
+// entries must exist in tagOwners.
+func validateSSHTestDestination(pol *Policy, alias Alias) error {
+	dst := alias.String()
+
+	switch a := alias.(type) {
+	case *AutoGroup:
+		// autogroup:internet is the only autogroup not valid here;
+		// member/tagged/self/nonroot pass to engine evaluation.
+		if *a == AutoGroupInternet {
+			return fmt.Errorf("%w %q", ErrSSHTestDstDisallowedElement, dst)
+		}
+
+	case *Prefix:
+		// A bare IP parses as `/BitLen` and is a valid single-host dst;
+		// any narrower CIDR is a multi-host range and is rejected.
+		p := netip.Prefix(*a)
+		if p.Bits() < p.Addr().BitLen() {
+			return fmt.Errorf("%w %q", ErrSSHTestDstDisallowedElement, dst)
+		}
+
+	case *Tag:
+		// A tag must be declared in tagOwners. `tag:server:22` lands
+		// here too because isTag only checks the prefix, so the lookup
+		// misses and the colon-port suffix surfaces as unknown-tag.
+		if pol == nil {
+			return fmt.Errorf("%w %q", ErrSSHTestDstUnknownTag, string(*a))
+		}
+
+		err := pol.TagOwners.Contains(a)
+		if err != nil {
+			return fmt.Errorf("%w %q", ErrSSHTestDstUnknownTag, string(*a))
+		}
+
+	case *Host:
+		// A hosts: alias that resolves to multiple addresses is a CIDR
+		// in disguise.
+		if pol == nil {
+			return nil
+		}
+
+		pref, ok := pol.Hosts[*a]
+		if !ok {
+			return nil
+		}
+
+		p := netip.Prefix(pref)
+		if p.Bits() < p.Addr().BitLen() {
+			return fmt.Errorf("%w %q", ErrSSHTestDstDisallowedElement, dst)
 		}
 	}
 

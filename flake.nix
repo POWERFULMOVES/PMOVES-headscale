@@ -27,7 +27,7 @@
         let
           pkgs = nixpkgs.legacyPackages.${prev.stdenv.hostPlatform.system};
           buildGo = pkgs.buildGo126Module;
-          vendorHash = "sha256-1jVYsI73Sa9/xigxldfvH0TkQThJIGGIq+1A7ARZ068=";
+          vendorHash = (builtins.fromJSON (builtins.readFile ./flakehashes.json)).vendor.sri;
         in
         {
           headscale = buildGo {
@@ -38,8 +38,8 @@
             # Only run unit tests when testing a build
             checkFlags = [ "-short" ];
 
-            # When updating go.mod or go.sum, a new sha will need to be calculated,
-            # update this if you have a mismatch after doing a change to those files.
+            # vendorHash is read from flakehashes.json; refresh via:
+            #   go run ./cmd/vendorhash update
             inherit vendorHash;
 
             subPackages = [ "cmd/headscale" ];
@@ -62,16 +62,16 @@
 
           protoc-gen-grpc-gateway = buildGo rec {
             pname = "grpc-gateway";
-            version = "2.28.0";
+            version = "2.29.0";
 
             src = pkgs.fetchFromGitHub {
               owner = "grpc-ecosystem";
               repo = "grpc-gateway";
               rev = "v${version}";
-              sha256 = "sha256-93omvHb+b+S0w4D+FGEEwYYDjgumJFDAruc1P4elfvA=";
+              sha256 = "sha256-d9OIIGttyMBSNgpS6mbR5JEIm13qGu2gFHJazJAexdw=";
             };
 
-            vendorHash = "sha256-jVP5zfFPfHeAEApKNJzZwuZLA+DjKgkL7m2DFG72UNs=";
+            vendorHash = "sha256-p51yD+v8+rPs+ztlX7r0VQ4XlwUkxu+PxgknKEvH00k=";
 
             nativeBuildInputs = [ pkgs.installShellFiles ];
 
@@ -97,16 +97,16 @@
           # Build golangci-lint with Go 1.26 (upstream uses hardcoded Go version)
           golangci-lint = buildGo rec {
             pname = "golangci-lint";
-            version = "2.11.4";
+            version = "2.12.2";
 
             src = pkgs.fetchFromGitHub {
               owner = "golangci";
               repo = "golangci-lint";
               rev = "v${version}";
-              hash = "sha256-B19aLvfNRY9TOYw/71f2vpNUuSIz8OI4dL0ijGezsas=";
+              hash = "sha256-qR7fp1x2S+EwEAcplRHTvA3jWwLr/XSiYKSZtAwkrNU=";
             };
 
-            vendorHash = "sha256-xuoj4+U4tB5gpABKq4Dbp2cxnljxdYoBbO8A7DqPM5E=";
+            vendorHash = "sha256-AG5wtLwWLz55bdp1oi3cW+9O3yj1W1P7MV9zxym7Pb4=";
 
             subPackages = [ "cmd/golangci-lint" ];
 
@@ -223,13 +223,7 @@
                 "nix-vendor-sri"
                 ''
                   set -eu
-
-                  OUT=$(mktemp -d -t nar-hash-XXXXXX)
-                  rm -rf "$OUT"
-
-                  go mod vendor -o "$OUT"
-                  go run tailscale.com/cmd/nardump --sri "$OUT"
-                  rm -rf "$OUT"
+                  exec go run ./cmd/vendorhash update "$@"
                 '')
 
               (pkgs.writeShellScriptBin

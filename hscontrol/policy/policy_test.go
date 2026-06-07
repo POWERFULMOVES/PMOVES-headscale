@@ -951,11 +951,13 @@ func TestReduceNodesFromPolicy(t *testing.T) {
   ]
 }`,
 			node: n(1, "100.64.0.1", "mobile", "mobile"),
-			// autogroup:internet does not generate packet filters - it's handled
-			// by exit node routing via AllowedIPs, not by packet filtering.
-			// Only server is visible through the mobile -> server:80 rule.
+			// autogroup:internet emits no client packet filter, but it
+			// must still produce a matcher: Node.CanAccess uses
+			// matcher.DestsIsTheInternet() + IsExitNode() to surface
+			// exit-node peers (juanfont/headscale#3212).
 			want: types.Nodes{
 				n(2, "100.64.0.2", "server", "server"),
+				n(3, "100.64.0.3", "exit", "server", "0.0.0.0/0", "::/0"),
 			},
 			wantMatchers: 1,
 		},
@@ -1315,7 +1317,7 @@ func TestSSHPolicyRules(t *testing.T) {
 				]
 			}`,
 			expectErr:    true,
-			errorMessage: `invalid SSH action: "invalid", must be one of: accept, check`,
+			errorMessage: `"invalid" is not a valid action`,
 		},
 		{
 			name:       "invalid-check-period",
@@ -1339,10 +1341,15 @@ func TestSSHPolicyRules(t *testing.T) {
 				]
 			}`,
 			expectErr:    true,
-			errorMessage: "not a valid duration string",
+			errorMessage: `time: invalid duration "invalid"`,
 		},
+		// `autogroup:invalid` as an SSH user is no longer rejected:
+		// SaaS treats every `autogroup:*` user-string as a literal
+		// label and compiles it into the SSHUsers map. The compat
+		// suite covers this via ssh-malformed-user-autogroup-* — no
+		// dedicated case is needed here.
 		{
-			name:       "unsupported-autogroup",
+			name:       "ssh-user-unknown-autogroup-as-literal",
 			targetNode: taggedClient,
 			peers:      types.Nodes{&nodeUser2},
 			policy: `{
@@ -1361,8 +1368,23 @@ func TestSSHPolicyRules(t *testing.T) {
 					}
 				]
 			}`,
-			expectErr:    true,
-			errorMessage: "autogroup not supported for SSH user",
+			wantSSH: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+				{
+					Principals: []*tailcfg.SSHPrincipal{
+						{NodeIP: "100.64.0.2"},
+					},
+					SSHUsers: map[string]string{
+						"autogroup:invalid": "autogroup:invalid",
+						"root":              "",
+					},
+					Action: &tailcfg.SSHAction{
+						Accept:                    true,
+						AllowAgentForwarding:      true,
+						AllowLocalPortForwarding:  true,
+						AllowRemotePortForwarding: true,
+					},
+				},
+			}},
 		},
 		{
 			name:       "autogroup-nonroot-should-use-wildcard-with-root-excluded",

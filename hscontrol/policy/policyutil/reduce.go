@@ -6,6 +6,7 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
+	"go4.org/netipx"
 	"tailscale.com/tailcfg"
 )
 
@@ -14,10 +15,12 @@ import (
 //
 // IMPORTANT: This function is designed for global filters only. Per-node filters
 // (from autogroup:self policies) are already node-specific and should not be passed
-// to this function. Use PolicyManager.FilterForNode() instead, which handles both cases.
+// to this function. Use [policy.PolicyManager.FilterForNode] instead, which handles
+// both cases.
 func ReduceFilterRules(node types.NodeView, rules []tailcfg.FilterRule) []tailcfg.FilterRule {
 	ret := []tailcfg.FilterRule{}
 	subnetRoutes := node.SubnetRoutes()
+	hasExitRoutes := node.IsExitNode()
 
 	for _, rule := range rules {
 		// Handle CapGrant rules separately — they use CapGrant[].Dsts
@@ -47,14 +50,23 @@ func ReduceFilterRules(node types.NodeView, rules []tailcfg.FilterRule) []tailcf
 			}
 
 			// If the node has approved subnet routes, preserve
-			// filter rules targeting those routes. SubnetRoutes()
-			// returns only approved, non-exit routes — matching
-			// Tailscale SaaS behavior, which does not generate
-			// filter rules for advertised-but-unapproved routes.
-			// Exit routes (0.0.0.0/0, ::/0) are excluded by
-			// SubnetRoutes() and handled separately via
-			// AllowedIPs/routing.
+			// filter rules targeting those routes.
+			// [types.NodeView.SubnetRoutes] returns only approved,
+			// non-exit routes — matching Tailscale SaaS behavior,
+			// which does not generate filter rules for
+			// advertised-but-unapproved routes. Exit routes
+			// (0.0.0.0/0, ::/0) are excluded by
+			// [types.NodeView.SubnetRoutes] and handled separately
+			// via AllowedIPs/routing.
 			if slices.ContainsFunc(subnetRoutes, expanded.OverlapsPrefix) {
+				dests = append(dests, dest)
+				continue
+			}
+
+			// Exit-route advertisers need rules targeting the
+			// public internet so the kernel filter accepts
+			// traffic forwarded by autogroup:internet sources.
+			if hasExitRoutes && ipSetSubsetOf(expanded, util.TheInternet()) {
 				dests = append(dests, dest)
 			}
 		}
@@ -71,11 +83,25 @@ func ReduceFilterRules(node types.NodeView, rules []tailcfg.FilterRule) []tailcf
 	return ret
 }
 
-// reduceCapGrantRule filters a CapGrant rule to only include CapGrant
-// entries whose Dsts match the given node's IPs. When a broad prefix
-// (e.g. 100.64.0.0/10 from dst:*) contains a node's IP, it is
+func ipSetSubsetOf(candidate, container *netipx.IPSet) bool {
+	if candidate == nil || container == nil {
+		return false
+	}
+
+	for _, pref := range candidate.Prefixes() {
+		if !container.ContainsPrefix(pref) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// reduceCapGrantRule filters a [tailcfg.CapGrant] rule to only include
+// [tailcfg.CapGrant] entries whose Dsts match the given node's IPs. When a
+// broad prefix (e.g. 100.64.0.0/10 from dst:*) contains a node's IP, it is
 // narrowed to the node's specific /32 or /128 prefix. Returns nil if
-// no CapGrant entries are relevant to this node.
+// no [tailcfg.CapGrant] entries are relevant to this node.
 func reduceCapGrantRule(
 	node types.NodeView,
 	rule tailcfg.FilterRule,
@@ -112,9 +138,9 @@ func reduceCapGrantRule(
 		// prefixes to node-specific /32 or /128 so peers receive only
 		// the minimum routing surface. The route-match loop below
 		// preserves the original prefix so the subnet-serving node
-		// receives the full CapGrant scope. SubnetRoutes() excludes
-		// both unapproved and exit routes, matching Tailscale SaaS
-		// behavior.
+		// receives the full CapGrant scope. [types.NodeView.SubnetRoutes]
+		// excludes both unapproved and exit routes, matching Tailscale
+		// SaaS behavior.
 		for _, dst := range cg.Dsts {
 			for _, subnetRoute := range subnetRoutes {
 				if dst.Overlaps(subnetRoute) {
@@ -127,7 +153,7 @@ func reduceCapGrantRule(
 		if len(matchingDsts) > 0 {
 			// A Dst can be appended twice when a broad prefix both
 			// contains a node IP and overlaps one of its approved
-			// subnet routes. Sort + Compact dedups; netip.Prefix is
+			// subnet routes. Sort + Compact dedups; [netip.Prefix] is
 			// comparable so Compact works with ==.
 			slices.SortFunc(matchingDsts, netip.Prefix.Compare)
 			matchingDsts = slices.Compact(matchingDsts)

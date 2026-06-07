@@ -1,6 +1,6 @@
 // Package servertest provides an in-process test harness for Headscale's
 // control plane. It wires a real Headscale server to real Tailscale
-// controlclient.Direct instances, enabling fast, deterministic tests
+// [controlclient.Direct] instances, enabling fast, deterministic tests
 // of the full control protocol without Docker or separate processes.
 package servertest
 
@@ -19,7 +19,7 @@ import (
 )
 
 // TestServer is an in-process Headscale control server suitable for
-// use with Tailscale's controlclient.Direct.
+// use with Tailscale's [controlclient.Direct].
 //
 // Networking uses tailscale.com/net/memnet so that all TCP
 // connections stay in-process — no real sockets are opened.
@@ -33,7 +33,7 @@ type TestServer struct {
 	st         *state.State
 }
 
-// ServerOption configures a TestServer.
+// ServerOption configures a [TestServer].
 type ServerOption func(*serverConfig)
 
 type serverConfig struct {
@@ -42,6 +42,7 @@ type serverConfig struct {
 	ephemeralTimeout time.Duration
 	nodeExpiry       time.Duration
 	batcherWorkers   int
+	taildropEnabled  bool
 }
 
 func defaultServerConfig() *serverConfig {
@@ -50,6 +51,7 @@ func defaultServerConfig() *serverConfig {
 		bufferedChanSize: 30,
 		batcherWorkers:   1,
 		ephemeralTimeout: 30 * time.Second,
+		taildropEnabled:  true,
 	}
 }
 
@@ -71,6 +73,15 @@ func WithEphemeralTimeout(d time.Duration) ServerOption {
 // WithNodeExpiry sets the default node key expiry duration.
 func WithNodeExpiry(d time.Duration) ServerOption {
 	return func(c *serverConfig) { c.nodeExpiry = d }
+}
+
+// WithTaildropEnabled toggles the Taildrop file-sharing feature.
+// Defaults to true to match production. Pass false to verify
+// behaviour when an operator has switched the toggle off — e.g.
+// that [tailcfg.CapabilityFileSharing] is withheld from the
+// always-on baseline.
+func WithTaildropEnabled(enabled bool) ServerOption {
+	return func(c *serverConfig) { c.taildropEnabled = enabled }
 }
 
 // NewServer creates and starts a Headscale test server.
@@ -111,6 +122,7 @@ func NewServer(tb testing.TB, opts ...ServerOption) *TestServer {
 		Policy: types.PolicyConfig{
 			Mode: types.PolicyModeDB,
 		},
+		Taildrop: types.TaildropConfig{Enabled: sc.taildropEnabled},
 		Tuning: types.Tuning{
 			BatchChangeDelay:               sc.batchDelay,
 			BatcherWorkers:                 sc.batcherWorkers,
@@ -189,15 +201,15 @@ func (s *TestServer) State() *state.State {
 
 // Close shuts down the in-memory HTTP server and listener.
 // Subsystem cleanup (batcher, ephemeral GC) is handled by
-// tb.Cleanup callbacks registered in StartBatcherForTest and
-// StartEphemeralGCForTest.
+// [testing.TB.Cleanup] callbacks registered in [hscontrol.Headscale.StartBatcherForTest] and
+// [hscontrol.Headscale.StartEphemeralGCForTest].
 func (s *TestServer) Close() {
 	s.httpServer.Close()
 	s.ln.Close()
 }
 
 // MemNet returns the in-memory network used by this server,
-// so that TestClient dialers can be wired to it.
+// so that [TestClient] dialers can be wired to it.
 func (s *TestServer) MemNet() *memnet.Network {
 	return s.memNet
 }
