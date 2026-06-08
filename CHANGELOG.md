@@ -2,7 +2,7 @@
 
 ## 0.29.0 (202x-xx-xx)
 
-**Minimum supported Tailscale client version: v1.76.0**
+**Minimum supported Tailscale client version: v1.80.0**
 
 ### Tailscale ACL compatibility improvements
 
@@ -27,6 +27,50 @@ A new `headscale auth` CLI command group supports the approval flow:
 [#1850](https://github.com/juanfont/headscale/pull/1850)
 [#3180](https://github.com/juanfont/headscale/pull/3180)
 
+### Policy tests (beta)
+
+Headscale now evaluates the `tests` block in a policy file. Tests assert reachability between
+named sources and destinations and cover the whole policy — both `acls` and `grants` rules
+contribute. They run on user-initiated writes via `headscale policy set`, on SIGHUP reload
+(`systemctl reload headscale` / `kill -HUP $(pidof headscale)`), and on `headscale policy check`.
+A failing test rejects the write before it is applied, with the same error message Tailscale SaaS
+would return for the same policy.
+
+At boot a stored policy whose tests no longer pass — for example because a referenced user was
+deleted while the server was offline — logs a warning and the server keeps running. Fix the
+policy and reload.
+
+This feature is **beta** while behavioural coverage against Tailscale SaaS broadens.
+
+[#3229](https://github.com/juanfont/headscale/pull/3229)
+
+### SSH policy tests (beta)
+
+Headscale now evaluates the `sshTests` block in a policy file. Each entry names a source, one or
+more destination hosts, and three optional user lists: `accept` asserts the listed login users
+reach every destination via an accept- or check-action SSH rule, `deny` asserts none of them
+reach any destination, and `check` requires reachability specifically through a check-action
+rule. Tests run on `headscale policy set`, on SIGHUP reload (`systemctl reload headscale` /
+`kill -HUP $(pidof headscale)`), and on `headscale policy check`. A failing test rejects the
+write before it is applied, with the same error message Tailscale SaaS would return for the same
+policy.
+
+At boot a stored policy whose sshTests no longer pass — for example because a referenced user was
+deleted while the server was offline — logs a warning and the server keeps running. Fix the
+policy and reload.
+
+This feature is **beta** while behavioural coverage against Tailscale SaaS broadens.
+
+[#3263](https://github.com/juanfont/headscale/pull/3263)
+
+### SSH rule validation
+
+SSH rule parsing now trims surrounding whitespace on `action`, `users`, `src`, and `dst`,
+rejects empty or wildcard entries in `users`, rejects empty `acceptEnv`, and rejects negative
+`checkPeriod`. `hosts:` aliases are rejected as SSH destinations, non-ASCII tag names are
+rejected at parse time, and the wording for group-nesting cycles matches Tailscale SaaS.
+[#3263](https://github.com/juanfont/headscale/pull/3263)
+
 ### Grants
 
 We now support [Tailscale grants](https://tailscale.com/docs/features/access-control/grants)
@@ -36,33 +80,82 @@ field steers traffic through specific tagged subnet routers or exit nodes. The `
 an ACL rule. Grants can be mixed with ACLs in the same policy file.
 [#2180](https://github.com/juanfont/headscale/pull/2180)
 
-As part of this, we added `autogroup:danger-all`. It resolves to `0.0.0.0/0` and `::/0` — all IP
+As part of this, we added `autogroup:danger-all`. It resolves to `0.0.0.0/0` and `::/0`, all IP
 addresses, including those outside the tailnet. This replaces the old behaviour where `*` matched
-all IPs (see BREAKING below). The name is intentionally scary: accepting traffic from the entire
+all IPs (see BREAKING below). The name is intentional: accepting traffic from the entire
 internet is a security-sensitive choice. `autogroup:danger-all` can only be used as a source.
 
-### Hostname handling (cleanroom rewrite)
+### Node attributes (`nodeAttrs`)
 
-The hostname ingest pipeline has been rewritten to match Tailscale SaaS byte-for-byte.
-Headscale previously had three overlapping regexes and two disagreeing entry points
-(registration vs map-request update), which caused a recurring class of bugs: names
-containing apostrophes, spaces, dots, or non-ASCII characters were alternately rejected
-(dropping updates with log spam) or stored as `invalid-<rand>` surrogates
-([#3188](https://github.com/juanfont/headscale/issues/3188),
-[#2926](https://github.com/juanfont/headscale/issues/2926),
-[#2343](https://github.com/juanfont/headscale/issues/2343),
-[#2762](https://github.com/juanfont/headscale/issues/2762),
-[#2177](https://github.com/juanfont/headscale/issues/2177),
-[#2121](https://github.com/juanfont/headscale/issues/2121),
-[#2449](https://github.com/juanfont/headscale/issues/2449),
-[#363](https://github.com/juanfont/headscale/issues/363)).
+ACL policies now accept a `nodeAttrs` block. Each entry hands a list of
+Tailscale node capabilities to every node matching `target`. The accepted
+target forms are the same as `acls.src` and `grants.src`: users, groups,
+tags, hosts, prefixes, `autogroup:member`, `autogroup:tagged`, and `*`.
 
-What changed:
+```jsonc
+{
+  "randomizeClientPort": true,
+  "nodeAttrs": [
+    { "target": ["autogroup:tagged"], "attr": ["disable-captive-portal-detection"] },
+    { "target": ["alice@example.com"], "attr": ["nextdns:abc123"] },
+  ],
+}
+```
 
-- Sanitisation and validation now come directly from
-  `tailscale.com/util/dnsname.SanitizeHostname` / `ValidLabel`.
-- Admin rename (`headscale nodes rename`) now validates via `dnsname.ValidLabel` and
-  rejects labels already held by another node (previously coerced invalid input silently).
+Frequently requested capabilities this unlocks include `magicdns-aaaa`,
+`disable-relay-server`, `disable-captive-portal-detection`,
+`nextdns:<profile>` / `nextdns:no-device-info`, `randomize-client-port`,
+and the Taildrive `drive:share` / `drive:access` pair. The set is not
+limited to these, any string-only cap an operator places in policy
+reaches clients unchanged.
+
+`randomizeClientPort` also lands as a top-level policy field that toggles
+the default for every node, replacing the old server-config knob.
+
+A new `auto_update.enabled` config option controls the tailnet-wide
+default for client auto-update. When true, every node's CapMap carries
+`default-auto-update: [true]` so fresh clients pick up the default
+unless they make a local opt-in / opt-out choice.
+
+Policies that use the `funnel` cap, `ipPool` blocks, or
+`autogroup:admin` / `autogroup:owner` targets are rejected at load —
+those features depend on machinery headscale does not yet ship.
+
+[#3251](https://github.com/juanfont/headscale/pull/3251)
+
+### Taildrive
+
+Taildrive ([file-sync between
+nodes](https://tailscale.com/docs/features/taildrive)) is now
+configurable through policy. Grant `drive:share` to the node that
+hosts files and `drive:access` to nodes that read or write them; pair
+with a `tailscale.com/cap/drive` grant to set the per-share access
+mode:
+
+```jsonc
+{
+  "nodeAttrs": [
+    { "target": ["tag:fileserver"], "attr": ["drive:share"] },
+    { "target": ["autogroup:member"], "attr": ["drive:access"] },
+  ],
+  "grants": [
+    {
+      "src": ["autogroup:member"],
+      "dst": ["tag:fileserver"],
+      "app": {
+        "tailscale.com/cap/drive": [{ "shares": ["*"], "access": "rw" }],
+      },
+    },
+  ],
+}
+```
+
+A wildcard `nodeAttrs` (`"target": ["*"]`) hands the caps to every
+node when fine-grained control is not needed.
+
+### Hostname sanitisation
+
+Hostnames are now santised using Tailscales `magicdns` sanitisation rules, matching Tailscale SaaS behavior. This means that hostnames with non-ASCII characters, special characters, or reserved DNS label characters are now transformed into valid DNS labels for MagicDNS. This improves our previously too strict sanitisation that rejected hostnames based on our guesswork and not based on the Tailscale upstream behaviour.
 
 Examples that previously regressed and now work:
 
@@ -75,11 +168,24 @@ Examples that previously regressed and now work:
 | `My-PC!`             | `My-PC!`             | `my-pc`               |
 | `我的电脑`           | `我的电脑`           | `node`                |
 
+[#3202](https://github.com/juanfont/headscale/pull/3202)
+
+### HA subnet router health probing
+
+Headscale now actively probes HA subnet routers to detect nodes that are connected but not
+forwarding traffic. The control plane periodically pings HA subnet routers via the Noise
+control channel and fails over to a healthy standby if the primary stops responding. This is
+enabled by default (`node.routes.ha.probe_interval: 10s`, `probe_timeout: 5s`) and only
+active when HA routes exist (2+ nodes advertising the same prefix). Set `probe_interval` to
+`0` to disable. This complements the existing disconnect-based failover, catching "zombie
+connected" routers that maintain their control session but cannot route packets.
+[#3194](https://github.com/juanfont/headscale/pull/3194)
+
 ### BREAKING
 
 #### Hostname handling
 
-- The `GivenName` collision policy changed from an 8-char random hash suffix (`laptop-abc12xyz`) to a monotonic numeric suffix (`laptop`, `laptop-1`, `laptop-2`, …), matching Tailscale SaaS. Empty / all-non-ASCII hostnames now fall back to the literal `node` instead of `invalid-<rand>`. MagicDNS names change on upgrade for any node whose previous label was a random-suffix form; the raw `Hostname` column is unchanged.
+- The `GivenName` collision policy changed from an 8-char random hash suffix (`laptop-abc12xyz`) to a monotonic numeric suffix (`laptop`, `laptop-1`, `laptop-2`, …), matching Tailscale SaaS. Empty / all-non-ASCII hostnames now fall back to the literal `node` instead of `invalid-<rand>`. MagicDNS names change on upgrade for any node whose previous label was a random-suffix form; the raw `Hostname` column is unchanged. [#3202](https://github.com/juanfont/headscale/pull/3202)
 
 #### ACL Policy
 
@@ -88,8 +194,8 @@ Examples that previously regressed and now work:
   - Policies that need to match all IP addresses including non-Tailscale IPs should use `autogroup:danger-all` as a source, or explicit CIDR ranges as destinations [#2180](https://github.com/juanfont/headscale/pull/2180)
   - `autogroup:danger-all` can only be used as a source; it cannot be used as a destination
   - **Note**: Users with non-standard IP ranges configured in `prefixes.ipv4` or `prefixes.ipv6` (which is unsupported and produces a warning) will need to explicitly specify their CIDR ranges in ACL rules instead of using `*`
-- Validate autogroup:self source restrictions matching Tailscale behavior - tags, hosts, and IPs are rejected as sources for autogroup:self destinations [#3036](https://github.com/juanfont/headscale/pull/3036)
-  - Policies using tags, hosts, or IP addresses as sources for autogroup:self destinations will now fail validation
+- Validate `autogroup:self` source restrictions matching Tailscale behavior - tags, hosts, and IPs are rejected as sources for `autogroup:self` destinations [#3036](https://github.com/juanfont/headscale/pull/3036)
+  - Policies using tags, hosts, or IP addresses as sources for `autogroup:self` destinations will now fail validation
 - The `proto:icmp` protocol name now only includes ICMPv4 (protocol 1), matching Tailscale behavior [#3036](https://github.com/juanfont/headscale/pull/3036)
   - Previously, `proto:icmp` included both ICMPv4 and ICMPv6
   - Use `proto:ipv6-icmp` or protocol number `58` explicitly for ICMPv6
@@ -101,20 +207,31 @@ Examples that previously regressed and now work:
   - Downgrading to a previous minor version is blocked
   - Patch version changes within the same minor are always allowed
 
+#### Configuration
+
+- The `randomize_client_port` server-config key was removed; the
+  toggle now lives in the policy file as a top-level
+  `randomizeClientPort` field, matching the Tailscale-hosted schema. [#3251](https://github.com/juanfont/headscale/pull/3251)
+  Headscale refuses to start when the old key is set. Move it to the
+  policy file referenced by `policy.path`:
+
+  ```jsonc
+  {
+    "randomizeClientPort": true,
+  }
+  ```
+
+  If you do not have a policy file yet, create one with that minimal
+  content and point `policy.path` at it. The default carries over —
+  empty / absent policy means `randomizeClientPort: false`, matching
+  the previous behaviour for operators who never set the key. Per-node
+  opt-in via `nodeAttrs` is also supported and stacks on top of the
+  global default.
+
 #### CLI
 
 - `headscale nodes register` is deprecated in favour of `headscale auth register --auth-id <id> --user <user>` [#1850](https://github.com/juanfont/headscale/pull/1850)
   - The old command continues to work but will be removed in a future release
-
-### HA subnet router health probing
-
-Headscale now actively probes HA subnet routers to detect nodes that are connected but not
-forwarding traffic. The control plane periodically pings HA subnet routers via the Noise
-control channel and fails over to a healthy standby if the primary stops responding. This is
-enabled by default (`node.routes.ha.probe_interval: 10s`, `probe_timeout: 5s`) and only
-active when HA routes exist (2+ nodes advertising the same prefix). Set `probe_interval` to
-`0` to disable. This complements the existing disconnect-based failover, catching "zombie
-connected" routers that maintain their control session but cannot route packets.
 
 ### Changes
 
@@ -133,6 +250,8 @@ connected" routers that maintain their control session but cannot route packets.
 - Fix non-wildcard source IPs being dropped when combined with wildcard `*` in the same ACL rule [#2180](https://github.com/juanfont/headscale/pull/2180)
 - Fix exit node approval not triggering filter rule recalculation for peers [#2180](https://github.com/juanfont/headscale/pull/2180)
 - Policy validation error messages now include field context (e.g., `src=`, `dst=`) and are more descriptive [#2180](https://github.com/juanfont/headscale/pull/2180)
+- Reject policies whose `user@` tokens match multiple DB users; rename the duplicate via `headscale users rename` to load [#3160](https://github.com/juanfont/headscale/issues/3160)
+- Evaluate the policy `tests` block on user-initiated writes across both `acls` and `grants`; reject policies whose tests fail (beta) [#1803](https://github.com/juanfont/headscale/issues/1803)
 
 #### Grants
 
@@ -151,9 +270,11 @@ connected" routers that maintain their control session but cannot route packets.
 
 - Add `headscale auth register`, `headscale auth approve`, and `headscale auth reject` CLI commands [#1850](https://github.com/juanfont/headscale/pull/1850)
 - Deprecate `headscale nodes register --key` in favour of `headscale auth register --auth-id` [#1850](https://github.com/juanfont/headscale/pull/1850)
+- `headscale policy check --bypass-grpc-and-access-database-directly` validates `user@` tokens against the live user database [#3160](https://github.com/juanfont/headscale/issues/3160)
 - Remove deprecated `--namespace` flag from `nodes list`, `nodes register`, and `debug create-node` commands (use `--user` instead) [#3093](https://github.com/juanfont/headscale/pull/3093)
 - Remove deprecated `namespace`/`ns` command aliases for `users` and `machine`/`machines` aliases for `nodes` [#3093](https://github.com/juanfont/headscale/pull/3093)
-- **User deletion**: Fix `DestroyUser` deleting all pre-auth keys in the database instead of only the target user's keys [#3155](https://github.com/juanfont/headscale/pull/3155)
+- Fix `DestroyUser` deleting all pre-auth keys in the database instead of only the target user's keys [#3155](https://github.com/juanfont/headscale/pull/3155)
+- `headscale policy check` evaluates the `tests` block when invoked with `--bypass-grpc-and-access-database-directly`; without the flag it warns instead of running the tests against empty data [#1803](https://github.com/juanfont/headscale/issues/1803)
 
 #### API
 
@@ -172,6 +293,7 @@ connected" routers that maintain their control session but cannot route packets.
   - Tagged nodes (registered with tagged pre-auth keys) are exempt from default expiry
   - `oidc.expiry` has been removed; use `node.expiry` instead (applies to all registration methods including OIDC)
   - `ephemeral_node_inactivity_timeout` is deprecated in favour of `node.ephemeral.inactivity_timeout`
+- Add `trusted_proxies` to gate `True-Client-IP` / `X-Real-IP` / `X-Forwarded-For` (previously honoured from any client) [#3268](https://github.com/juanfont/headscale/pull/3268)
 
 #### Debug
 
@@ -183,6 +305,10 @@ connected" routers that maintain their control session but cannot route packets.
 
 - Remove old migrations for the debian package [#3185](https://github.com/juanfont/headscale/pull/3185)
 - Install `config-example.yaml` as example for the debian package [#3186](https://github.com/juanfont/headscale/pull/3186)
+- Fix user-owned re-registration with zero client expiry and no default storing `0001-01-01 00:00:00` in the database instead of `NULL` [#3199](https://github.com/juanfont/headscale/pull/3199)
+- Fix `tailscaled` restart on a node with no expiry resetting `NULL` to `0001-01-01 00:00:00` in the database, affecting both tagged and untagged nodes [#3197](https://github.com/juanfont/headscale/pull/3197)
+- Backfill `nodes.expiry` rows persisted by older versions as `0001-01-01 00:00:00` to `NULL`, so nodes upgraded from <0.28 stop reporting as expired [#3284](https://github.com/juanfont/headscale/issues/3284)
+- Update reverse proxy documentation for `trusted_proxies` configuration option [#3292](https://github.com/juanfont/headscale/pull/3292)
 
 ## 0.28.0 (2026-02-04)
 

@@ -35,6 +35,7 @@ var (
 	errServerURLSuffix           = errors.New("server_url cannot be part of base_domain in a way that could make the DERP and headscale server unreachable")
 	errServerURLSame             = errors.New("server_url cannot use the same domain as base_domain in a way that could make the DERP and headscale server unreachable")
 	errInvalidPKCEMethod         = errors.New("pkce.method must be either 'plain' or 'S256'")
+	errTrustedProxyZeroRange     = errors.New("0.0.0.0/0 and ::/0 are not allowed")
 	ErrNoPrefixConfigured        = errors.New("no IPv4 or IPv6 prefix configured, minimum one prefix is required")
 	ErrInvalidAllocationStrategy = errors.New("invalid prefix allocation strategy")
 )
@@ -67,7 +68,7 @@ type HARouteConfig struct {
 	ProbeInterval time.Duration
 
 	// ProbeTimeout is the maximum time to wait for a probe response
-	// before declaring a node unhealthy. Must be less than ProbeInterval.
+	// before declaring a node unhealthy. Must be less than [HARouteConfig.ProbeInterval].
 	ProbeTimeout time.Duration
 }
 
@@ -98,6 +99,7 @@ type Config struct {
 	MetricsAddr         string
 	GRPCAddr            string
 	GRPCAllowInsecure   bool
+	TrustedProxies      []netip.Prefix
 	Node                NodeConfig
 	PrefixV4            *netip.Prefix
 	PrefixV6            *netip.Prefix
@@ -118,7 +120,7 @@ type Config struct {
 
 	// DNSConfig is the headscale representation of the DNS configuration.
 	// It is kept in the config update for some settings that are
-	// not directly converted into a tailcfg.DNSConfig.
+	// not directly converted into a [tailcfg.DNSConfig].
 	DNSConfig DNSConfig
 
 	// TailcfgDNSConfig is the tailcfg representation of the DNS configuration,
@@ -130,9 +132,9 @@ type Config struct {
 
 	OIDC OIDCConfig
 
-	LogTail             LogTailConfig
-	RandomizeClientPort bool
-	Taildrop            TaildropConfig
+	LogTail    LogTailConfig
+	Taildrop   TaildropConfig
+	AutoUpdate AutoUpdateConfig
 
 	CLI CLIConfig
 
@@ -254,6 +256,15 @@ type TaildropConfig struct {
 	Enabled bool
 }
 
+// AutoUpdateConfig controls the tailnet-wide default for client
+// auto-update. When Enabled is true, headscale emits the
+// [tailcfg.NodeAttrDefaultAutoUpdate] cap with value [true] on every
+// node's CapMap; clients fall back to that default unless they have
+// opted in or out locally.
+type AutoUpdateConfig struct {
+	Enabled bool
+}
+
 type CLIConfig struct {
 	Address  string
 	APIKey   string `json:"-"` // never serialise the headscale admin API key
@@ -326,7 +337,7 @@ type Tuning struct {
 	// NodeStoreBatchTimeout is the maximum time to wait before processing a
 	// partial batch of node operations.
 	//
-	// When NodeStoreBatchSize operations haven't accumulated, this timeout ensures
+	// When [Tuning.NodeStoreBatchSize] operations haven't accumulated, this timeout ensures
 	// writes don't wait indefinitely. The batch processes when either the size
 	// threshold is reached OR this timeout expires, whichever comes first.
 	//
@@ -344,8 +355,8 @@ func validatePKCEMethod(method string) error {
 	return nil
 }
 
-// Domain returns the hostname/domain part of the ServerURL.
-// If the ServerURL is not a valid URL, it returns the BaseDomain.
+// Domain returns the hostname/domain part of the [Config.ServerURL].
+// If the [Config.ServerURL] is not a valid URL, it returns the [Config.BaseDomain].
 func (c *Config) Domain() string {
 	u, err := url.Parse(c.ServerURL)
 	if err != nil {
@@ -358,7 +369,7 @@ func (c *Config) Domain() string {
 // LoadConfig prepares and loads the Headscale configuration into Viper.
 // This means it sets the default values, reads the configuration file and
 // environment variables, and handles deprecated configuration options.
-// It has to be called before LoadServerConfig and LoadCLIConfig.
+// It has to be called before [LoadServerConfig] and [LoadCLIConfig].
 // The configuration is not validated and the caller should check for errors
 // using a validation function.
 func LoadConfig(path string, isFile bool) error {
@@ -428,8 +439,8 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("oidc.email_verified_required", true)
 
 	viper.SetDefault("logtail.enabled", false)
-	viper.SetDefault("randomize_client_port", false)
 	viper.SetDefault("taildrop.enabled", true)
+	viper.SetDefault("auto_update.enabled", false)
 
 	viper.SetDefault("node.expiry", "0")
 	viper.SetDefault("node.ephemeral.inactivity_timeout", "120s")
@@ -529,6 +540,16 @@ func validateServerConfig() error {
 	// Removed since version v0.26.0
 	depr.fatal("oidc.strip_email_domain")
 	depr.fatal("oidc.map_legacy_users")
+
+	// Removed since v0.29.0: `randomize_client_port` moved to the ACL
+	// policy as a top-level `randomizeClientPort` field, matching the
+	// Tailscale-hosted control plane schema. Per-node `nodeAttrs`
+	// entries granting `https://tailscale.com/cap/randomize-client-port`
+	// also work.
+	depr.fatalWithHint("randomize_client_port",
+		`Set "randomizeClientPort": true at the top level of your policy file `+
+			`(see policy.path / policy.mode), or grant the cap per-node via a `+
+			`"nodeAttrs" entry. See CHANGELOG.md (BREAKING / Configuration).`)
 
 	// Deprecated: ephemeral_node_inactivity_timeout -> node.ephemeral.inactivity_timeout
 	depr.warnNoAlias("node.ephemeral.inactivity_timeout", "ephemeral_node_inactivity_timeout")
@@ -1030,6 +1051,31 @@ func prefixV6() (*netip.Prefix, bool, error) {
 	return &prefixV6, !ipSet.ContainsPrefix(prefixV6), nil
 }
 
+// trustedProxies rejects 0.0.0.0/0 and ::/0 because they defeat the
+// peer-trust gate and almost always indicate misconfiguration.
+func trustedProxies() ([]netip.Prefix, error) {
+	raw := viper.GetStringSlice("trusted_proxies")
+	if len(raw) == 0 {
+		return nil, nil
+	}
+
+	out := make([]netip.Prefix, 0, len(raw))
+	for i, s := range raw {
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
+			return nil, fmt.Errorf("trusted_proxies[%d] %q: %w", i, s, err)
+		}
+
+		if p.Bits() == 0 {
+			return nil, fmt.Errorf("trusted_proxies[%d] %q: %w", i, s, errTrustedProxyZeroRange)
+		}
+
+		out = append(out, p.Masked())
+	}
+
+	return out, nil
+}
+
 // LoadCLIConfig returns the needed configuration for the CLI client
 // of Headscale to connect to a Headscale server.
 func LoadCLIConfig() (*Config, error) {
@@ -1065,6 +1111,11 @@ func LoadServerConfig() (*Config, error) {
 	}
 
 	prefix6, v6NonStandard, err := prefixV6()
+	if err != nil {
+		return nil, err
+	}
+
+	trusted, err := trustedProxies()
 	if err != nil {
 		return nil, err
 	}
@@ -1120,7 +1171,6 @@ func LoadServerConfig() (*Config, error) {
 
 	derpConfig := derpConfig()
 	logTailConfig := logtailConfig()
-	randomizeClientPort := viper.GetBool("randomize_client_port")
 
 	oidcClientSecret := viper.GetString("oidc.client_secret")
 
@@ -1160,6 +1210,7 @@ func LoadServerConfig() (*Config, error) {
 		MetricsAddr:        viper.GetString("metrics_listen_addr"),
 		GRPCAddr:           viper.GetString("grpc_listen_addr"),
 		GRPCAllowInsecure:  viper.GetBool("grpc_allow_insecure"),
+		TrustedProxies:     trusted,
 		DisableUpdateCheck: false,
 
 		PrefixV4:     prefix4,
@@ -1219,10 +1270,12 @@ func LoadServerConfig() (*Config, error) {
 			},
 		},
 
-		LogTail:             logTailConfig,
-		RandomizeClientPort: randomizeClientPort,
+		LogTail: logTailConfig,
 		Taildrop: TaildropConfig{
 			Enabled: viper.GetBool("taildrop.enabled"),
+		},
+		AutoUpdate: AutoUpdateConfig{
+			Enabled: viper.GetBool("auto_update.enabled"),
 		},
 
 		Policy: policyConfig(),
@@ -1325,6 +1378,22 @@ func (d *deprecator) fatal(oldKey string) {
 			fmt.Sprintf(
 				"The %q configuration key has been removed. Please see the changelog for more details.",
 				oldKey,
+			),
+		)
+	}
+}
+
+// fatalWithHint behaves like fatal but appends a remediation pointer to
+// the message so operators see exactly what to do without leaving the
+// terminal. Use it when the removed key has a clean replacement on the
+// policy side.
+func (d *deprecator) fatalWithHint(oldKey, hint string) {
+	if viper.IsSet(oldKey) {
+		d.fatals.Add(
+			fmt.Sprintf(
+				"The %q configuration key has been removed. %s",
+				oldKey,
+				hint,
 			),
 		)
 	}

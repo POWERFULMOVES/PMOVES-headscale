@@ -1,6 +1,6 @@
 // This file implements a data-driven test runner for grant compatibility
 // tests. It loads HuJSON golden files from testdata/grant_results/grant-*.hujson
-// and via-grant-*.hujson, captured from Tailscale SaaS by tscap, and compares
+// and via-grant-*.hujson, captured from a Tailscale-hosted control plane, and compares
 // headscale's grants engine output against the captured packet filter rules.
 //
 // Each file is a testcapture.Capture containing:
@@ -35,225 +35,13 @@ import (
 
 // setupGrantsCompatUsers returns the 3 test users for grants compatibility tests.
 // Users get norse-god names; nodes get original-151 pokémon names — matching
-// the anonymized identifiers tscap writes into the capture files
-// (see github.com/kradalby/tscap/anonymize).
+// the anonymized identifiers the capture tool writes into the capture files
+// .
 func setupGrantsCompatUsers() types.Users {
 	return types.Users{
 		{Model: gorm.Model{ID: 1}, Name: "odin", Email: "odin@example.com"},
 		{Model: gorm.Model{ID: 2}, Name: "thor", Email: "thor@example.org"},
 		{Model: gorm.Model{ID: 3}, Name: "freya", Email: "freya@example.com"},
-	}
-}
-
-// setupGrantsCompatNodes returns the 15 test nodes for grants compatibility tests.
-// The node configuration matches the Tailscale test environment:
-//   - 3 user-owned nodes (bulbasaur, ivysaur, venusaur)
-//   - 12 tagged nodes (beedrill, kakuna, weedle, squirtle, charmander,
-//     pidgey, pidgeotto, rattata, raticate, spearow, fearow, blastoise)
-func setupGrantsCompatNodes(users types.Users) types.Nodes {
-	nodeBulbasaur := &types.Node{
-		ID:        1,
-		GivenName: "bulbasaur",
-		User:      &users[0],
-		UserID:    &users[0].ID,
-		IPv4:      ptrAddr("100.90.199.68"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::2d01:c747"),
-		Hostinfo:  &tailcfg.Hostinfo{},
-	}
-
-	nodeIvysaur := &types.Node{
-		ID:        2,
-		GivenName: "ivysaur",
-		User:      &users[1],
-		UserID:    &users[1].ID,
-		IPv4:      ptrAddr("100.110.121.96"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::1737:7960"),
-		Hostinfo:  &tailcfg.Hostinfo{},
-	}
-
-	nodeVenusaur := &types.Node{
-		ID:        3,
-		GivenName: "venusaur",
-		User:      &users[2],
-		UserID:    &users[2].ID,
-		IPv4:      ptrAddr("100.103.90.82"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::9e37:5a52"),
-		Hostinfo:  &tailcfg.Hostinfo{},
-	}
-
-	nodeBeedrill := &types.Node{
-		ID:        4,
-		GivenName: "beedrill",
-		IPv4:      ptrAddr("100.108.74.26"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::b901:4a87"),
-		Tags:      []string{"tag:server"},
-		Hostinfo:  &tailcfg.Hostinfo{},
-	}
-
-	nodeKakuna := &types.Node{
-		ID:        5,
-		GivenName: "kakuna",
-		IPv4:      ptrAddr("100.103.8.15"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::5b37:80f"),
-		Tags:      []string{"tag:prod"},
-		Hostinfo:  &tailcfg.Hostinfo{},
-	}
-
-	nodeWeedle := &types.Node{
-		ID:        6,
-		GivenName: "weedle",
-		IPv4:      ptrAddr("100.83.200.69"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::c537:c845"),
-		Tags:      []string{"tag:client"},
-		Hostinfo:  &tailcfg.Hostinfo{},
-	}
-
-	nodeSquirtle := &types.Node{
-		ID:        7,
-		GivenName: "squirtle",
-		IPv4:      ptrAddr("100.92.142.61"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::3e37:8e3d"),
-		Tags:      []string{"tag:router"},
-		Hostinfo: &tailcfg.Hostinfo{
-			RoutableIPs: []netip.Prefix{netip.MustParsePrefix("10.33.0.0/16")},
-		},
-		ApprovedRoutes: []netip.Prefix{netip.MustParsePrefix("10.33.0.0/16")},
-	}
-
-	nodeCharmander := &types.Node{
-		ID:        8,
-		GivenName: "charmander",
-		IPv4:      ptrAddr("100.85.66.106"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::7c37:426a"),
-		Tags:      []string{"tag:exit"},
-		Hostinfo: &tailcfg.Hostinfo{
-			RoutableIPs: []netip.Prefix{
-				netip.MustParsePrefix("0.0.0.0/0"),
-				netip.MustParsePrefix("::/0"),
-			},
-		},
-		ApprovedRoutes: []netip.Prefix{
-			netip.MustParsePrefix("0.0.0.0/0"),
-			netip.MustParsePrefix("::/0"),
-		},
-	}
-
-	// --- New nodes for expanded via grant topology ---
-
-	nodePidgey := &types.Node{
-		ID:        9,
-		GivenName: "pidgey",
-		IPv4:      ptrAddr("100.124.195.93"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::7837:c35d"),
-		Tags:      []string{"tag:exit-a"},
-		Hostinfo: &tailcfg.Hostinfo{
-			RoutableIPs: []netip.Prefix{
-				netip.MustParsePrefix("0.0.0.0/0"),
-				netip.MustParsePrefix("::/0"),
-			},
-		},
-		ApprovedRoutes: []netip.Prefix{
-			netip.MustParsePrefix("0.0.0.0/0"),
-			netip.MustParsePrefix("::/0"),
-		},
-	}
-
-	nodePidgeotto := &types.Node{
-		ID:        10,
-		GivenName: "pidgeotto",
-		IPv4:      ptrAddr("100.116.18.24"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::ff37:1218"),
-		Tags:      []string{"tag:exit-b"},
-		Hostinfo: &tailcfg.Hostinfo{
-			RoutableIPs: []netip.Prefix{
-				netip.MustParsePrefix("0.0.0.0/0"),
-				netip.MustParsePrefix("::/0"),
-			},
-		},
-		ApprovedRoutes: []netip.Prefix{
-			netip.MustParsePrefix("0.0.0.0/0"),
-			netip.MustParsePrefix("::/0"),
-		},
-	}
-
-	nodeRattata := &types.Node{
-		ID:        11,
-		GivenName: "rattata",
-		IPv4:      ptrAddr("100.107.162.14"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::a237:a20e"),
-		Tags:      []string{"tag:group-a"},
-		Hostinfo:  &tailcfg.Hostinfo{},
-	}
-
-	nodeRaticate := &types.Node{
-		ID:        12,
-		GivenName: "raticate",
-		IPv4:      ptrAddr("100.77.135.18"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::4b37:8712"),
-		Tags:      []string{"tag:group-b"},
-		Hostinfo:  &tailcfg.Hostinfo{},
-	}
-
-	nodeSpearow := &types.Node{
-		ID:        13,
-		GivenName: "spearow",
-		IPv4:      ptrAddr("100.109.43.124"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::a537:2b7c"),
-		Tags:      []string{"tag:router-a"},
-		Hostinfo: &tailcfg.Hostinfo{
-			RoutableIPs: []netip.Prefix{netip.MustParsePrefix("10.44.0.0/16")},
-		},
-		ApprovedRoutes: []netip.Prefix{netip.MustParsePrefix("10.44.0.0/16")},
-	}
-
-	nodeFearow := &types.Node{
-		ID:        14,
-		GivenName: "fearow",
-		IPv4:      ptrAddr("100.65.172.123"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::5a37:ac7c"),
-		Tags:      []string{"tag:router-b"},
-		Hostinfo: &tailcfg.Hostinfo{
-			RoutableIPs: []netip.Prefix{netip.MustParsePrefix("10.55.0.0/16")},
-		},
-		ApprovedRoutes: []netip.Prefix{netip.MustParsePrefix("10.55.0.0/16")},
-	}
-
-	nodeBlastoise := &types.Node{
-		ID:        15,
-		GivenName: "blastoise",
-		IPv4:      ptrAddr("100.105.127.107"),
-		IPv6:      ptrAddr("fd7a:115c:a1e0::9537:7f6b"),
-		Tags:      []string{"tag:exit", "tag:router"},
-		Hostinfo: &tailcfg.Hostinfo{
-			RoutableIPs: []netip.Prefix{
-				netip.MustParsePrefix("10.33.0.0/16"),
-				netip.MustParsePrefix("0.0.0.0/0"),
-				netip.MustParsePrefix("::/0"),
-			},
-		},
-		ApprovedRoutes: []netip.Prefix{
-			netip.MustParsePrefix("10.33.0.0/16"),
-			netip.MustParsePrefix("0.0.0.0/0"),
-			netip.MustParsePrefix("::/0"),
-		},
-	}
-
-	return types.Nodes{
-		nodeBulbasaur,
-		nodeIvysaur,
-		nodeVenusaur,
-		nodeBeedrill,
-		nodeKakuna,
-		nodeWeedle,
-		nodeSquirtle,
-		nodeCharmander,
-		nodePidgey,
-		nodePidgeotto,
-		nodeRattata,
-		nodeRaticate,
-		nodeSpearow,
-		nodeFearow,
-		nodeBlastoise,
 	}
 }
 
@@ -269,7 +57,7 @@ func findGrantsNode(nodes types.Nodes, name string) *types.Node {
 }
 
 // buildGrantsNodesFromCapture constructs types.Nodes from a capture's
-// topology section. Each scenario in tscap uses clean-slate mode, so
+// topology section. Each scenario in the capture tool uses clean-slate mode, so
 // node IPs differ between scenarios; this builds the node set with
 // the IPs that were actually present during that capture.
 func buildGrantsNodesFromCapture(
@@ -332,7 +120,7 @@ func buildGrantsNodesFromCapture(
 }
 
 // convertPolicyUserEmails used to map SaaS-side emails to @example.com.
-// tscap now anonymizes the policy JSON at write time (kratail2tid -> odin,
+// captures anonymize the policy JSON at write time (kratail2tid -> odin,
 // kristoffer -> thor, monitorpasskeykradalby -> freya), so the captured
 // FullPolicy is already in its final form and this is a passthrough that
 // just adapts the captured string value to the []byte that the policy
@@ -405,12 +193,12 @@ func TestGrantsCompat(t *testing.T) {
 			}
 
 			// Build nodes per-scenario from this file's topology.
-			// tscap uses clean-slate mode, so each scenario has
+			// the capture tool uses clean-slate mode, so each scenario has
 			// different node IPs.
 			nodes := buildGrantsNodesFromCapture(users, tf)
 
-			// Use the captured full policy verbatim (anonymization
-			// in tscap already rewrote SaaS emails).
+			// Use the captured full policy as is (anonymization
+			// the capture tool already rewrote SaaS emails).
 			policyJSON := convertPolicyUserEmails(tf.Input.FullPolicy)
 
 			if tf.Input.APIResponseCode == 400 || tf.Error {
@@ -457,7 +245,7 @@ func testGrantError(t *testing.T, policyJSON []byte, tf *testcapture.Capture) {
 }
 
 // assertGrantErrorContains requires that headscale's error contains
-// the Tailscale SaaS error message verbatim. Divergence means an
+// the Tailscale SaaS error message exactly. Divergence means an
 // emitter needs to be aligned, not papered over with a translation
 // table.
 func assertGrantErrorContains(t *testing.T, err error, wantMsg string, testID string) {
@@ -496,17 +284,10 @@ func testGrantSuccess(
 				"golden node %s not found in test setup", nodeName)
 
 			// Compile headscale filter rules for this node
-			gotRules, err := pol.compileFilterRulesForNode(
+			gotRules := pol.compileFilterRulesForNode(
 				users,
 				node.View(),
 				nodes.ViewSlice(),
-			)
-			require.NoError(
-				t,
-				err,
-				"%s/%s: failed to compile filter rules",
-				tf.TestID,
-				nodeName,
 			)
 
 			gotRules = policyutil.ReduceFilterRules(node.View(), gotRules)

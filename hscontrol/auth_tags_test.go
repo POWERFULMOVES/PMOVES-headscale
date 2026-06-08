@@ -1,6 +1,7 @@
 package hscontrol
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -59,7 +60,7 @@ func createTestAppWithNodeExpiry(t *testing.T, nodeExpiry time.Duration) *Headsc
 // a tagged node with:
 // - Tags from the PreAuthKey
 // - Nil UserID (tagged nodes are owned by tags, not a user)
-// - IsTagged() returns true.
+// - [types.Node.IsTagged] returns true.
 func TestTaggedPreAuthKeyCreatesTaggedNode(t *testing.T) {
 	app := createTestApp(t)
 
@@ -112,7 +113,7 @@ func TestTaggedPreAuthKeyCreatesTaggedNode(t *testing.T) {
 // authentication. This is critical for the container restart scenario (#2830).
 //
 // NOTE: This test verifies that re-authentication preserves the node's current tags
-// without testing tag modification via SetNodeTags (which requires ACL policy setup).
+// without testing tag modification via [state.State.SetNodeTags] (which requires ACL policy setup).
 func TestReAuthDoesNotReapplyTags(t *testing.T) {
 	app := createTestApp(t)
 
@@ -179,7 +180,7 @@ func TestReAuthDoesNotReapplyTags(t *testing.T) {
 }
 
 // NOTE: TestSetTagsOnUserOwnedNode functionality is covered by gRPC tests in grpcv1_test.go
-// which properly handle ACL policy setup. The test verifies that SetTags can convert
+// which properly handle ACL policy setup. The test verifies that [headscaleV1APIServer.SetTags] can convert
 // user-owned nodes to tagged nodes while preserving UserID.
 
 // TestCannotRemoveAllTags tests that attempting to remove all tags from a
@@ -669,10 +670,151 @@ func TestTaggedNodeReauthPreservesDisabledExpiry(t *testing.T) {
 		"Tagged node should have expiry PRESERVED as disabled after re-auth")
 }
 
+// TestTaggedNodeRestartPreservesNilExpiry tests that a tagged node whose
+// tailscaled restarts (sending Auth=nil, Expiry=zero) keeps its nil expiry.
+//
+// The handleRegister guard required node.Expiry().Valid(), false for the
+// nil expiry tagged nodes are created with. The request fell through to
+// handleLogout, which wrote &time.Time{} over the original nil and flipped
+// the API representation from null to "0001-01-01T00:00:00Z".
+func TestTaggedNodeRestartPreservesNilExpiry(t *testing.T) {
+	app := createTestApp(t)
+
+	user := app.state.CreateUserForTest("tag-restart")
+	tags := []string{"tag:agent"}
+
+	pak, err := app.state.CreatePreAuthKey(user.TypedID(), true, false, nil, tags)
+	require.NoError(t, err)
+
+	machineKey := key.NewMachine()
+	nodeKey := key.NewNode()
+
+	regReq := tailcfg.RegisterRequest{
+		Auth: &tailcfg.RegisterResponseAuth{
+			AuthKey: pak.Key,
+		},
+		NodeKey: nodeKey.Public(),
+		Hostinfo: &tailcfg.Hostinfo{
+			Hostname: "tagged-restart-test",
+		},
+	}
+
+	resp, err := app.handleRegisterWithAuthKey(regReq, machineKey.Public())
+	require.NoError(t, err)
+	require.True(t, resp.MachineAuthorized)
+
+	node, found := app.state.GetNodeByNodeKey(nodeKey.Public())
+	require.True(t, found)
+	require.True(t, node.IsTagged())
+	require.False(t, node.Expiry().Valid(), "tagged node should have nil expiry after registration")
+	require.False(t, node.IsExpired(), "tagged node with nil expiry should not be expired")
+
+	// tailscaled restart: RegisterRequest with Auth=nil and Expiry=time.Time{}
+	// (the Go zero value) is what the client sends when it restarts with
+	// persisted state.
+	restartReq := tailcfg.RegisterRequest{
+		Auth:    nil,
+		NodeKey: nodeKey.Public(),
+		Expiry:  time.Time{},
+	}
+
+	restartResp, err := app.handleRegister(context.Background(), restartReq, machineKey.Public())
+	require.NoError(t, err)
+
+	require.True(t, restartResp.MachineAuthorized,
+		"restart should not require re-authorization")
+	require.False(t, restartResp.NodeKeyExpired,
+		"restart should not mark node key as expired")
+	require.Equal(t, types.TaggedDevices.View().TailscaleUser(), restartResp.User,
+		"response should identify node as tagged device")
+
+	nodeAfterRestart, found := app.state.GetNodeByNodeKey(nodeKey.Public())
+	require.True(t, found)
+
+	assert.True(t, nodeAfterRestart.IsTagged(), "node should still be tagged")
+	assert.False(t, nodeAfterRestart.IsExpired(), "node should not be expired after restart")
+	assert.False(t, nodeAfterRestart.Expiry().Valid(),
+		"tagged node expiry must remain nil (not zero-time) after restart")
+
+	var dbNode types.Node
+	require.NoError(t,
+		app.state.DB().DB.First(&dbNode, nodeAfterRestart.ID().Uint64()).Error)
+	assert.Nil(t, dbNode.Expiry,
+		"database expiry column must be NULL after restart, not a pointer to zero-time")
+}
+
+// TestUntaggedNodeRestartPreservesNilExpiry tests that an untagged node
+// registered against a preauth key with no default node.expiry keeps its
+// nil expiry when tailscaled restarts. Same root cause as the tagged
+// variant: the dropped node.Expiry().Valid() check covers any nil-expiry
+// node, regardless of ownership.
+func TestUntaggedNodeRestartPreservesNilExpiry(t *testing.T) {
+	app := createTestAppWithNodeExpiry(t, 0)
+
+	user := app.state.CreateUserForTest("untagged-restart")
+
+	pak, err := app.state.CreatePreAuthKey(user.TypedID(), true, false, nil, nil)
+	require.NoError(t, err)
+
+	machineKey := key.NewMachine()
+	nodeKey := key.NewNode()
+
+	regReq := tailcfg.RegisterRequest{
+		Auth: &tailcfg.RegisterResponseAuth{
+			AuthKey: pak.Key,
+		},
+		NodeKey: nodeKey.Public(),
+		Hostinfo: &tailcfg.Hostinfo{
+			Hostname: "untagged-restart-test",
+		},
+		Expiry: time.Time{},
+	}
+
+	resp, err := app.handleRegisterWithAuthKey(regReq, machineKey.Public())
+	require.NoError(t, err)
+	require.True(t, resp.MachineAuthorized)
+
+	node, found := app.state.GetNodeByNodeKey(nodeKey.Public())
+	require.True(t, found)
+	require.False(t, node.IsTagged(), "node should be user-owned, not tagged")
+	require.False(t, node.Expiry().Valid(),
+		"untagged node with no default expiry should have nil expiry after registration")
+	require.False(t, node.IsExpired())
+
+	restartReq := tailcfg.RegisterRequest{
+		Auth:    nil,
+		NodeKey: nodeKey.Public(),
+		Expiry:  time.Time{},
+	}
+
+	restartResp, err := app.handleRegister(context.Background(), restartReq, machineKey.Public())
+	require.NoError(t, err)
+
+	require.True(t, restartResp.MachineAuthorized,
+		"restart should not require re-authorization")
+	require.False(t, restartResp.NodeKeyExpired,
+		"restart should not mark node key as expired")
+
+	nodeAfterRestart, found := app.state.GetNodeByNodeKey(nodeKey.Public())
+	require.True(t, found)
+
+	assert.False(t, nodeAfterRestart.IsTagged(), "node should still be user-owned")
+	assert.False(t, nodeAfterRestart.IsExpired(), "node should not be expired after restart")
+	assert.False(t, nodeAfterRestart.Expiry().Valid(),
+		"untagged node expiry must remain nil (not zero-time) after restart")
+
+	var dbNode types.Node
+	require.NoError(t,
+		app.state.DB().DB.First(&dbNode, nodeAfterRestart.ID().Uint64()).Error)
+	assert.Nil(t, dbNode.Expiry,
+		"database expiry column must be NULL after restart, not a pointer to zero-time "+
+			"(this is what `sqlite3 ... 'select expiry from nodes'` sees)")
+}
+
 // TestExpiryDuringPersonalToTaggedConversion tests that when a personal node
 // is converted to tagged via reauth with RequestTags, the expiry is cleared to nil.
-// BUG #3048: Previously expiry was NOT cleared because expiry handling ran
-// BEFORE processReauthTags.
+// Previously expiry was NOT cleared because expiry handling ran
+// BEFORE [state.State.processReauthTags].
 func TestExpiryDuringPersonalToTaggedConversion(t *testing.T) {
 	app := createTestApp(t)
 	user := app.state.CreateUserForTest("expiry-test-user")
@@ -744,8 +886,8 @@ func TestExpiryDuringPersonalToTaggedConversion(t *testing.T) {
 // TestExpiryDuringTaggedToPersonalConversion tests that when a tagged node
 // is converted to personal via reauth with empty RequestTags, expiry is set
 // from the client request.
-// BUG #3048: Previously expiry was NOT set because expiry handling ran
-// BEFORE processReauthTags (node was still tagged at check time).
+// Previously expiry was NOT set because expiry handling ran
+// BEFORE [state.State.processReauthTags] (node was still tagged at check time).
 func TestExpiryDuringTaggedToPersonalConversion(t *testing.T) {
 	app := createTestApp(t)
 	user := app.state.CreateUserForTest("expiry-test-user2")
@@ -1003,7 +1145,7 @@ func TestNodeExpiryZeroDisablesDefault(t *testing.T) {
 	assert.False(t, node.IsExpired(), "node should not be expired")
 
 	// With node.expiry=0 and zero client expiry, the node gets a zero expiry
-	// which IsExpired() treats as "never expires" — backwards compatible.
+	// which [types.Node.IsExpired] treats as "never expires" — backwards compatible.
 	if node.Expiry().Valid() {
 		assert.True(t, node.Expiry().Get().IsZero(),
 			"with node.expiry=0 and zero client expiry, expiry should be zero time")
@@ -1118,4 +1260,73 @@ func TestReregistrationAppliesDefaultExpiry(t *testing.T) {
 		"re-registration should refresh the default expiry")
 	assert.True(t, node2.Expiry().Get().After(firstExpiry),
 		"re-registration expiry should be later than initial registration expiry")
+}
+
+// TestReregistrationZeroExpiryStaysNil tests that when a user-owned node
+// re-registers with zero client expiry and node.expiry is disabled (0),
+// the node's expiry stays nil rather than being set to a pointer to zero
+// time. Regression test for the else branch introduced in commit 6337a3db
+// which assigned `&regReq.Expiry` (pointer to [time.Time]{}) instead of nil,
+// causing the database row to hold `0001-01-01 00:00:00` instead of NULL.
+//
+// The same !regReq.Expiry.IsZero() gate at state.go:2221-2228 is shared by
+// the tags-only PreAuthKey path ([state.State.createAndSaveNewNode] also receives nil
+// when the client sends zero expiry), so this regression is covered for
+// tagged nodes by inspection.
+func TestReregistrationZeroExpiryStaysNil(t *testing.T) {
+	t.Parallel()
+
+	// node.expiry = 0 means "no default expiry"
+	app := createTestAppWithNodeExpiry(t, 0)
+
+	user := app.state.CreateUserForTest("node-owner")
+
+	pak, err := app.state.CreatePreAuthKey(user.TypedID(), true, false, nil, nil)
+	require.NoError(t, err)
+
+	machineKey := key.NewMachine()
+	nodeKey := key.NewNode()
+
+	// Initial registration with zero client expiry
+	regReq := tailcfg.RegisterRequest{
+		Auth: &tailcfg.RegisterResponseAuth{
+			AuthKey: pak.Key,
+		},
+		NodeKey: nodeKey.Public(),
+		Hostinfo: &tailcfg.Hostinfo{
+			Hostname: "reregister-zero-expiry",
+		},
+		Expiry: time.Time{},
+	}
+
+	resp, err := app.handleRegisterWithAuthKey(regReq, machineKey.Public())
+	require.NoError(t, err)
+	require.True(t, resp.MachineAuthorized)
+
+	node, found := app.state.GetNodeByNodeKey(nodeKey.Public())
+	require.True(t, found)
+	assert.False(t, node.Expiry().Valid(),
+		"initial registration with zero expiry and no default should leave expiry nil")
+
+	// Re-register with a new node key but same machine key + user
+	nodeKey2 := key.NewNode()
+	regReq2 := tailcfg.RegisterRequest{
+		Auth: &tailcfg.RegisterResponseAuth{
+			AuthKey: pak.Key,
+		},
+		NodeKey: nodeKey2.Public(),
+		Hostinfo: &tailcfg.Hostinfo{
+			Hostname: "reregister-zero-expiry",
+		},
+		Expiry: time.Time{}, // still zero
+	}
+
+	resp2, err := app.handleRegisterWithAuthKey(regReq2, machineKey.Public())
+	require.NoError(t, err)
+	require.True(t, resp2.MachineAuthorized)
+
+	node2, found := app.state.GetNodeByNodeKey(nodeKey2.Public())
+	require.True(t, found)
+	assert.False(t, node2.Expiry().Valid(),
+		"re-registration with zero client expiry and no default should leave expiry nil, not pointer to zero time")
 }

@@ -1,18 +1,18 @@
 // Package testcapture defines the on-disk format used by Headscale's
-// policy v2 compatibility tests for golden data captured from
-// Tailscale SaaS by the tscap tool.
+// policy v2 compatibility tests for golden data captured from a
+// Tailscale-hosted control plane by an external capture tool.
 //
 // Files are HuJSON. Wire-format Tailscale data (filter rules, netmap,
 // whois, SSH rules) is stored as proper tailcfg/netmap/filtertype/
-// apitype values rather than json.RawMessage so that schema drift
-// between tscap and headscale becomes a compile error rather than a
-// silent test failure, and so that consumers don't have to repeat
-// json.Unmarshal at every read site. Storing data as json.RawMessage
-// previously hid a serious capture-pipeline bug (the IPN bus initial
-// notification returns a stale Peers slice — see the comment on
-// Node.Netmap below) for months.
+// apitype values rather than [json.RawMessage] so that schema drift
+// between the capture tool and headscale becomes a compile error
+// rather than a silent test failure, and so that consumers don't
+// have to repeat [json.Unmarshal] at every read site. Storing data as
+// [json.RawMessage] previously hid a serious capture-pipeline bug (the
+// IPN bus initial notification returns a stale Peers slice — see the
+// comment on [Node.Netmap] below) for months.
 //
-// All four corpora (acl, routes, grant, ssh) use the same Capture
+// All four capture types (acl, routes, grant, ssh) use the same [Capture]
 // shape. SSH scenarios populate Captures[name].SSHRules; the others
 // populate Captures[name].PacketFilterRules + Captures[name].Netmap.
 package testcapture
@@ -31,17 +31,17 @@ import (
 // SchemaVersion identifies the on-disk format. Bumped on breaking changes.
 //
 // Files written before SchemaVersion existed do not have this field; new
-// captures from tscap always set it to the current value.
+// captures always set it to the current value.
 const SchemaVersion = 1
 
 // Capture is one captured run of one scenario.
 //
-// All four corpora (acl, routes, grant, ssh) use this same shape.
-// SSH scenarios populate Captures[name].SSHRules; the others populate
-// Captures[name].PacketFilterRules + Captures[name].Netmap.
+// All four capture types (acl, routes, grant, ssh) use this same shape.
+// SSH scenarios populate [Capture.Captures][name].SSHRules; the others populate
+// [Capture.Captures][name].PacketFilterRules + [Capture.Captures][name].Netmap.
 type Capture struct {
 	// SchemaVersion identifies the on-disk format version. Always set
-	// to testcapture.SchemaVersion when written by tscap.
+	// to [SchemaVersion] when written.
 	SchemaVersion int `json:"schema_version"`
 
 	// TestID is the stable identifier of the scenario, derived from
@@ -67,15 +67,15 @@ type Capture struct {
 	Tailnet string `json:"tailnet"`
 
 	// Error is true when the SaaS API rejected the policy or when
-	// capture itself failed. In the rejection case, Captures reflects
-	// the pre-push baseline (deny-all default) and Input.APIResponseBody
+	// capture itself failed. In the rejection case, [Capture.Captures] reflects
+	// the pre-push baseline (deny-all default) and [Input.APIResponseBody]
 	// is populated.
 	Error bool `json:"error,omitempty"`
 
 	// CaptureError is set when the capture itself failed (timeout,
-	// missing data, etc.). The partially-captured Captures map is
+	// missing data, etc.). The partially-captured [Capture.Captures] map is
 	// still included for post-mortem. Distinct from
-	// Input.APIResponseBody which describes a SaaS API rejection.
+	// [Input.APIResponseBody] which describes a SaaS API rejection.
 	CaptureError string `json:"capture_error,omitempty"`
 
 	// Input is everything that was sent to the tailnet to produce
@@ -83,7 +83,7 @@ type Capture struct {
 	Input Input `json:"input"`
 
 	// Topology is the users and nodes present in the tailnet at
-	// capture time. Always populated by tscap.
+	// capture time. Always populated by the capture tool.
 	Topology Topology `json:"topology"`
 
 	// Captures holds the per-node captured data, keyed by node
@@ -94,13 +94,13 @@ type Capture struct {
 // Input describes everything that was sent to the tailnet to produce
 // the captured state.
 //
-// Input has a custom UnmarshalJSON to accept both the new on-disk
+// [Input] has a custom [Input.UnmarshalJSON] to accept both the new on-disk
 // shape (where full_policy is a JSON-encoded string) and the legacy
 // shape (where full_policy is a JSON object). The legacy shape is
 // re-marshaled to a string at load time so consumers see the typed
 // field uniformly.
 type Input struct {
-	// FullPolicy is the verbatim policy that was POSTed to the SaaS
+	// FullPolicy is the unchanged policy that was POSTed to the SaaS
 	// API. Stored as a string because it is opaque JSON that round-
 	// trips losslessly without parsing — headscale's policy parser
 	// reads it on demand.
@@ -109,14 +109,14 @@ type Input struct {
 	// APIResponseCode is the HTTP status code of the policy POST.
 	APIResponseCode int `json:"api_response_code"`
 
-	// APIResponseBody is only populated when APIResponseCode != 200.
+	// APIResponseBody is only populated when [Input.APIResponseCode] != 200.
 	APIResponseBody *APIResponseBody `json:"api_response_body,omitempty"`
 
-	// Tailnet describes the tailnet-wide settings tscap applied
+	// Tailnet describes the tailnet-wide settings the capture tool applied
 	// before pushing the policy.
 	Tailnet TailnetInput `json:"tailnet"`
 
-	// ScenarioHuJSON is the verbatim contents of the scenario file
+	// ScenarioHuJSON is the unchanged contents of the scenario file
 	// (HuJSON). Reading this back is enough to re-run the exact
 	// same scenario.
 	ScenarioHuJSON string `json:"scenario_hujson"`
@@ -126,10 +126,10 @@ type Input struct {
 	ScenarioPath string `json:"scenario_path,omitempty"`
 }
 
-// MarshalJSON writes FullPolicy as a raw JSON object rather than a
+// MarshalJSON writes [Input.FullPolicy] as a raw JSON object rather than a
 // double-quoted string. Consumers (including via_compat_test.go which
 // uses its own local types) expect to parse full_policy as a JSON
-// object, not a JSON string. The UnmarshalJSON below accepts both
+// object, not a JSON string. The [Input.UnmarshalJSON] below accepts both
 // forms on read so old and new captures are interchangeable.
 func (i Input) MarshalJSON() ([]byte, error) {
 	type alias Input
@@ -153,7 +153,7 @@ func (i Input) MarshalJSON() ([]byte, error) {
 // as a JSON-encoded string) and the legacy shape (full_policy as a
 // JSON object). Legacy objects are re-marshaled into a string at
 // load time so consumers see the typed field uniformly. New captures
-// always write the object form via the custom MarshalJSON above.
+// always write the object form via the custom [Input.MarshalJSON] above.
 func (i *Input) UnmarshalJSON(data []byte) error {
 	type alias Input
 
@@ -171,7 +171,7 @@ func (i *Input) UnmarshalJSON(data []byte) error {
 	*i = Input(raw.alias)
 	// raw.FullPolicy might be a JSON-encoded string ("...") or a JSON
 	// object/array/null. Try string first; on failure use the raw bytes
-	// verbatim, normalised to compact form.
+	// as is, normalised to compact form.
 	if len(raw.FullPolicy) == 0 || string(raw.FullPolicy) == "null" {
 		i.FullPolicy = ""
 		return nil
@@ -209,7 +209,7 @@ type APIResponseBody struct {
 	Message string `json:"message,omitempty"`
 }
 
-// TailnetInput captures tailnet-wide settings tscap applied before
+// TailnetInput captures tailnet-wide settings the capture tool applied before
 // pushing the policy.
 type TailnetInput struct {
 	DNS      DNSInput      `json:"dns"`
@@ -227,18 +227,25 @@ type DNSInput struct {
 // SettingsInput describes tailnet settings applied via the API.
 //
 // Pointer fields are nil when the scenario does not override the
-// reset default for that setting.
+// reset default for that setting. The fields mirror the
+// PATCH /tailnet/{tailnet}/settings request shape exposed by
+// tailscale.com/client/tailscale/v2 — in practice the headscale
+// compatibility tests use the subset that observably affects the
+// captured netmap CapMap or DNSConfig.
 type SettingsInput struct {
-	DevicesApprovalOn      *bool `json:"devices_approval_on,omitempty"`
-	DevicesAutoUpdatesOn   *bool `json:"devices_auto_updates_on,omitempty"`
-	DevicesKeyDurationDays *int  `json:"devices_key_duration_days,omitempty"`
+	DevicesApprovalOn           *bool `json:"devices_approval_on,omitempty"`
+	DevicesAutoUpdatesOn        *bool `json:"devices_auto_updates_on,omitempty"`
+	DevicesKeyDurationDays      *int  `json:"devices_key_duration_days,omitempty"`
+	NetworkFlowLoggingOn        *bool `json:"network_flow_logging_on,omitempty"`
+	RegionalRoutingOn           *bool `json:"regional_routing_on,omitempty"`
+	PostureIdentityCollectionOn *bool `json:"posture_identity_collection_on,omitempty"`
 }
 
 // Topology describes the users and nodes present in the tailnet at
 // capture time. Headscale's compat tests use this to construct
-// equivalent types.User and types.Node objects.
+// equivalent [types.User] and [types.Node] objects.
 type Topology struct {
-	// Users in the tailnet. Always populated by tscap.
+	// Users in the tailnet. Always populated by the capture tool.
 	Users []TopologyUser `json:"users"`
 
 	// Nodes in the tailnet, keyed by GivenName.
@@ -259,24 +266,24 @@ type TopologyNode struct {
 	IPv4     string   `json:"ipv4"`
 	IPv6     string   `json:"ipv6"`
 
-	// User is the TopologyUser.Name for user-owned nodes. Empty for
+	// User is the [TopologyUser.Name] for user-owned nodes. Empty for
 	// tagged nodes.
 	User string `json:"user,omitempty"`
 
 	// RoutableIPs is what the node advertised
-	// (Hostinfo.RoutableIPs in its own netmap.SelfNode).
+	// ([tailcfg.Hostinfo.RoutableIPs] in its own [netmap.NetworkMap.SelfNode]).
 	// May include 0.0.0.0/0 + ::/0 for exit nodes.
 	RoutableIPs []string `json:"routable_ips"`
 
-	// ApprovedRoutes is the subset of RoutableIPs the tailnet has
+	// ApprovedRoutes is the subset of [TopologyNode.RoutableIPs] the tailnet has
 	// approved. Used by Headscale's NodeCanApproveRoute test.
 	ApprovedRoutes []string `json:"approved_routes"`
 }
 
 // Node is the captured state for one node, keyed by GivenName in
-// Capture.Captures.
+// [Capture.Captures].
 //
-// All four corpora populate the same struct. Different fields are
+// All four capture types populate the same struct. Different fields are
 // used by different test types:
 //
 //   - acl, routes, grant: PacketFilterRules + PacketFilterMatches + Netmap
@@ -293,23 +300,23 @@ type Node struct {
 	// PacketFilterMatches is the compiled filter matches (with
 	// CapMatch) returned by tailscaled localapi
 	// /debug-packet-filter-matches. Captured alongside
-	// PacketFilterRules; useful for grant tests that want the
+	// [Node.PacketFilterRules]; useful for grant tests that want the
 	// compiled form.
 	PacketFilterMatches []filtertype.Match `json:"packet_filter_matches,omitempty"`
 
 	// Netmap is the full netmap as observed by the local tailscaled.
 	// NEVER trimmed. Consumers extract whatever fields they need.
 	//
-	// IMPORTANT: tscap captures this by waiting for the IPN bus to
+	// IMPORTANT: the capture tool captures this by waiting for the IPN bus to
 	// settle on a fresh delta-triggered notification, NOT by reading
 	// the WatchIPNBus(NotifyInitialNetMap) initial notification.
 	// The initial notification carries cn.NetMap() which returns
-	// nb.netMap as-is — the netmap.NetworkMap whose Peers slice was
+	// nb.netMap as-is — the [netmap.NetworkMap] whose Peers slice was
 	// set at full-sync time and never re-synchronized from the
-	// authoritative nb.peers map. tscap previously used the initial
+	// authoritative nb.peers map. The capture tool previously used the initial
 	// notification and silently captured netmaps with mostly-empty
 	// Peers, which corrupted every via-grant compat test against the
-	// stale data. See tscap/tsdaemon/capture.go:NetMap for the
+	// stale data. See the capture tool source for the for the
 	// stability-wait pattern, and tailscale.com/ipn/ipnlocal/c2n.go
 	// :handleC2NDebugNetMap which uses netMapWithPeers() for the
 	// same reason.
@@ -320,6 +327,6 @@ type Node struct {
 	Whois map[string]*apitype.WhoIsResponse `json:"whois,omitempty"`
 
 	// SSHRules is the SSH rules slice extracted from
-	// netmap.SSHPolicy.Rules. Populated only for SSH scenarios.
+	// [netmap.NetworkMap.SSHPolicy].Rules. Populated only for SSH scenarios.
 	SSHRules []*tailcfg.SSHRule `json:"ssh_rules,omitempty"`
 }

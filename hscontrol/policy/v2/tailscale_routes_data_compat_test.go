@@ -1,6 +1,6 @@
 // This file implements data-driven test runners for routes compatibility tests.
 // It loads HuJSON golden files from testdata/routes_results/routes-*.hujson,
-// captured from Tailscale SaaS by tscap, and compares headscale's route-aware
+// captured from a Tailscale-hosted control plane, and compares headscale's route-aware
 // ACL engine output against the captured packet filter rules.
 //
 // Each capture file is a testcapture.Capture containing:
@@ -57,7 +57,7 @@ func loadRoutesTestFile(t *testing.T, path string) *testcapture.Capture {
 }
 
 // convertSaaSEmail used to map SaaS-side emails to @example.com placeholders.
-// tscap now anonymizes captures at write time (norse-god names + pokémon
+// captures are anonymized at write time (norse-god names + pokémon
 // hostnames), so the captured topology emails are already in their final
 // form and this is a passthrough.
 func convertSaaSEmail(email string) string {
@@ -236,17 +236,10 @@ func TestRoutesCompat(t *testing.T) {
 					require.NotNilf(t, node,
 						"golden node %s not found in topology", nodeName)
 
-					compiledRules, err := pol.compileFilterRulesForNode(
+					compiledRules := pol.compileFilterRulesForNode(
 						users,
 						node.View(),
 						nodes.ViewSlice(),
-					)
-					require.NoError(
-						t,
-						err,
-						"%s/%s: failed to compile filter rules",
-						tf.TestID,
-						nodeName,
 					)
 
 					gotRules := policyutil.ReduceFilterRules(
@@ -1552,7 +1545,7 @@ func testRoutesError(t *testing.T, tf *testcapture.Capture) {
 }
 
 // assertRoutesErrorContains requires that headscale's error contains
-// the Tailscale SaaS error message verbatim. Divergence means an
+// the Tailscale SaaS error message exactly. Divergence means an
 // emitter needs to be aligned, not papered over with a translation
 // table.
 func assertRoutesErrorContains(

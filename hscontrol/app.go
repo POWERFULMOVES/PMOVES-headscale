@@ -99,6 +99,10 @@ type Headscale struct {
 
 	DERPServer *derpServer.DERPServer
 
+	// realIPMiddleware is nil when cfg.TrustedProxies is empty; the
+	// router skips the mount and r.RemoteAddr stays as the TCP peer.
+	realIPMiddleware func(http.Handler) http.Handler
+
 	// Things that generate changes
 	extraRecordMan *dns.ExtraRecordsMan
 	authProvider   AuthProvider
@@ -138,6 +142,13 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		noisePrivateKey:   noisePrivateKey,
 		clientStreamsOpen: sync.WaitGroup{},
 		state:             s,
+	}
+
+	if len(cfg.TrustedProxies) > 0 {
+		app.realIPMiddleware, err = trustedProxyRealIP(cfg.TrustedProxies)
+		if err != nil {
+			return nil, fmt.Errorf("building trusted_proxies middleware: %w", err)
+		}
 	}
 
 	// Initialize ephemeral garbage collector
@@ -208,7 +219,19 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		}
 
 		for _, d := range magicDNSDomains {
-			app.cfg.TailcfgDNSConfig.Routes[d.WithoutTrailingDot()] = nil
+			// Empty non-nil slice rather than nil: tailcfg.DNSConfig.Clone
+			// and dns.Config.Clone in tailscale drop map entries whose
+			// value is nil (see tailscale.com/tailcfg/tailcfg_clone.go and
+			// tailscale.com/net/dns/dns_clone.go: `if sv == nil { continue }`).
+			// Sending nil here caused the client's wgengine LinkChange:major
+			// handler to clobber /etc/resolv.conf on every tunnel-IP rebind
+			// — the handler reapplies a Clone of lastDNSConfig and the magic
+			// DNS routes vanish, taking the resolver with them for ~6 min
+			// until the next route-changing netmap. Empty slice survives
+			// Clone and carries the same "resolve locally" semantics
+			// (tailscale.com/ipn/ipnlocal/node_backend.go:869 documents the
+			// empty-resolver Routes form for Issue 2706).
+			app.cfg.TailcfgDNSConfig.Routes[d.WithoutTrailingDot()] = []*dnstype.Resolver{}
 		}
 	}
 
@@ -251,7 +274,7 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 // Redirect to our TLS url.
 func (h *Headscale) redirect(w http.ResponseWriter, req *http.Request) {
 	target := h.cfg.ServerURL + req.URL.RequestURI()
-	http.Redirect(w, req, target, http.StatusFound)
+	http.Redirect(w, req, target, http.StatusFound) //nolint:gosec // G710: target prefixed by trusted ServerURL
 }
 
 func (h *Headscale) scheduledTasks(ctx context.Context) {
@@ -512,7 +535,11 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 		},
 	}))
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
+
+	if h.realIPMiddleware != nil {
+		r.Use(h.realIPMiddleware)
+	}
+
 	r.Use(middleware.RequestLogger(&zerologRequestLogger{}))
 	r.Use(middleware.Recoverer)
 	r.Use(securityHeaders)
@@ -553,7 +580,7 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 		r.HandleFunc("/v1/*", grpcMux.ServeHTTP)
 	})
 	// Ping response endpoint: receives HEAD from clients responding
-	// to a PingRequest. The unguessable ping ID serves as authentication.
+	// to a [tailcfg.PingRequest]. The unguessable ping ID serves as authentication.
 	r.Head("/machine/ping-response", h.PingResponseHandler)
 
 	r.Get("/favicon.ico", FaviconHandler)
@@ -1117,7 +1144,7 @@ func (h *Headscale) Change(cs ...change.Change) {
 	h.mapBatcher.AddWork(cs...)
 }
 
-// HTTPHandler returns an http.Handler for the Headscale control server.
+// HTTPHandler returns an [http.Handler] for the [Headscale] control server.
 // The handler serves the Tailscale control protocol including the /key
 // endpoint and /ts2021 Noise upgrade path.
 func (h *Headscale) HTTPHandler() http.Handler {
@@ -1197,7 +1224,7 @@ func (l *acmeLogger) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-// zerologRequestLogger implements chi's middleware.LogFormatter
+// [zerologRequestLogger] implements chi's [middleware.LogFormatter]
 // to route HTTP request logs through zerolog.
 type zerologRequestLogger struct{}
 

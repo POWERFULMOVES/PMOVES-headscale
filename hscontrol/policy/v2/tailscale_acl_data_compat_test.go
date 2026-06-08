@@ -1,7 +1,7 @@
 // This file implements a data-driven test runner for ACL compatibility tests.
 // It loads HuJSON golden files from testdata/acl_results/acl-*.hujson and
 // compares headscale's ACL engine output against the expected packet filter
-// rules captured from Tailscale SaaS by the tscap tool.
+// rules captured from a Tailscale-hosted control plane by an external capture tool.
 //
 // Each file is a testcapture.Capture containing:
 //   - The full policy that was POSTed to the Tailscale SaaS API
@@ -40,68 +40,14 @@ func ptrAddr(s string) *netip.Addr {
 }
 
 // setupACLCompatUsers returns the 3 test users for ACL compatibility tests.
-// Names and emails match the anonymized identifiers tscap writes into the
-// capture files (see github.com/kradalby/tscap/anonymize): users get
+// Names and emails match the anonymized identifiers the capture tool writes into the
+// capture files users get
 // norse-god names and nodes get original-151 pokémon names.
 func setupACLCompatUsers() types.Users {
 	return types.Users{
 		{Model: gorm.Model{ID: 1}, Name: "odin", Email: "odin@example.com"},
 		{Model: gorm.Model{ID: 2}, Name: "thor", Email: "thor@example.org"},
 		{Model: gorm.Model{ID: 3}, Name: "freya", Email: "freya@example.com"},
-	}
-}
-
-// setupACLCompatNodes returns the 8 test nodes for ACL compatibility tests.
-// Node GivenNames match tscap's anonymized pokémon naming.
-func setupACLCompatNodes(users types.Users) types.Nodes {
-	return types.Nodes{
-		{
-			ID: 1, GivenName: "bulbasaur",
-			User: &users[0], UserID: &users[0].ID,
-			IPv4: ptrAddr("100.90.199.68"), IPv6: ptrAddr("fd7a:115c:a1e0::2d01:c747"),
-			Hostinfo: &tailcfg.Hostinfo{},
-		},
-		{
-			ID: 2, GivenName: "ivysaur",
-			User: &users[1], UserID: &users[1].ID,
-			IPv4: ptrAddr("100.110.121.96"), IPv6: ptrAddr("fd7a:115c:a1e0::1737:7960"),
-			Hostinfo: &tailcfg.Hostinfo{},
-		},
-		{
-			ID: 3, GivenName: "venusaur",
-			User: &users[2], UserID: &users[2].ID,
-			IPv4: ptrAddr("100.103.90.82"), IPv6: ptrAddr("fd7a:115c:a1e0::9e37:5a52"),
-			Hostinfo: &tailcfg.Hostinfo{},
-		},
-		{
-			ID: 4, GivenName: "beedrill",
-			IPv4: ptrAddr("100.108.74.26"), IPv6: ptrAddr("fd7a:115c:a1e0::b901:4a87"),
-			Tags: []string{"tag:server"}, Hostinfo: &tailcfg.Hostinfo{},
-		},
-		{
-			ID: 5, GivenName: "kakuna",
-			IPv4: ptrAddr("100.103.8.15"), IPv6: ptrAddr("fd7a:115c:a1e0::5b37:80f"),
-			Tags: []string{"tag:prod"}, Hostinfo: &tailcfg.Hostinfo{},
-		},
-		{
-			ID: 6, GivenName: "weedle",
-			IPv4: ptrAddr("100.83.200.69"), IPv6: ptrAddr("fd7a:115c:a1e0::c537:c845"),
-			Tags: []string{"tag:client"}, Hostinfo: &tailcfg.Hostinfo{},
-		},
-		{
-			ID: 7, GivenName: "squirtle",
-			IPv4: ptrAddr("100.92.142.61"), IPv6: ptrAddr("fd7a:115c:a1e0::3e37:8e3d"),
-			Tags: []string{"tag:router"},
-			Hostinfo: &tailcfg.Hostinfo{
-				RoutableIPs: []netip.Prefix{netip.MustParsePrefix("10.33.0.0/16")},
-			},
-			ApprovedRoutes: []netip.Prefix{netip.MustParsePrefix("10.33.0.0/16")},
-		},
-		{
-			ID: 8, GivenName: "charmander",
-			IPv4: ptrAddr("100.85.66.106"), IPv6: ptrAddr("fd7a:115c:a1e0::7c37:426a"),
-			Tags: []string{"tag:exit"}, Hostinfo: &tailcfg.Hostinfo{},
-		},
 	}
 }
 
@@ -291,7 +237,7 @@ func TestACLCompat(t *testing.T) {
 			}
 
 			// Build nodes per-scenario from this file's topology.
-			// tscap uses clean-slate mode, so each scenario has
+			// the capture tool uses clean-slate mode, so each scenario has
 			// different node IPs; using a shared topology would
 			// cause IP mismatches in filter rule comparisons.
 			users, nodes := buildACLUsersAndNodes(t, tf)
@@ -344,7 +290,7 @@ func testACLError(t *testing.T, tf *testcapture.Capture) {
 }
 
 // assertACLErrorContains requires that headscale's error contains the
-// Tailscale SaaS error message verbatim. Divergence means an emitter
+// Tailscale SaaS error message exactly. Divergence means an emitter
 // needs to be aligned, not papered over with a translation table.
 func assertACLErrorContains(
 	t *testing.T,
@@ -411,17 +357,10 @@ func testACLSuccess(
 			}
 
 			// Compile headscale filter rules for this node
-			compiledRules, err := pol.compileFilterRulesForNode(
+			compiledRules := pol.compileFilterRulesForNode(
 				users,
 				node.View(),
 				nodes.ViewSlice(),
-			)
-			require.NoError(
-				t,
-				err,
-				"%s/%s: failed to compile filter rules",
-				tf.TestID,
-				nodeName,
 			)
 
 			gotRules := policyutil.ReduceFilterRules(
