@@ -283,15 +283,28 @@ func (b *Batcher) AddNode(
 	// Initialize last used timestamp
 	newEntry.lastUsed.Store(now.Unix())
 
-	// Get or create multiChannelNodeConn - this reuses existing offline nodes for rapid reconnection
-	nodeConn, loaded := b.nodes.LoadOrStore(id, newMultiChannelNodeConn(id, b.mapper))
+	// Get or create the multiChannelNodeConn and register this connection in a
+	// single Compute so the new connection is visible atomically. Doing the
+	// LoadOrStore and addConnection as separate steps let cleanupOfflineNodes
+	// (which deletes via Compute when hasActiveConnections() is false) observe a
+	// reused offline conn with zero connections mid-reconnect and delete it,
+	// orphaning the live connection.
+	var nodeConn *multiChannelNodeConn
 
-	if !loaded {
-		b.totalNodes.Add(1)
-	}
+	b.nodes.Compute(
+		id,
+		func(existing *multiChannelNodeConn, loaded bool) (*multiChannelNodeConn, xsync.ComputeOp) {
+			if !loaded || existing == nil {
+				existing = newMultiChannelNodeConn(id, b.mapper)
+				b.totalNodes.Add(1)
+			}
 
-	// Add connection to the list (lock-free)
-	nodeConn.addConnection(newEntry)
+			existing.addConnection(newEntry)
+			nodeConn = existing
+
+			return existing, xsync.UpdateOp
+		},
+	)
 
 	// Use the worker pool for controlled concurrency instead of direct generation
 	initialMap, err := b.MapResponseFromChange(id, change.FullSelf(id))
@@ -310,7 +323,12 @@ func (b *Batcher) AddNode(
 	// and we want to avoid the race condition where the receiver isn't ready yet
 	select {
 	case c <- initialMap:
-		// Success
+		// Record sent peers only after confirmed delivery, mirroring the async
+		// path, and under workMu so a concurrent async bundle for this node
+		// cannot interleave its own lastSentPeers update.
+		nodeConn.workMu.Lock()
+		nodeConn.updateSentPeers(initialMap)
+		nodeConn.workMu.Unlock()
 	case <-time.After(5 * time.Second): //nolint:mnd
 		nlog.Error().Err(ErrInitialMapSendTimeout).Msg("initial map send timeout")
 		nlog.Debug().Caller().Dur("timeout.duration", 5*time.Second). //nolint:mnd
@@ -483,9 +501,11 @@ func (b *Batcher) worker(workerID int) {
 							Uint64(zf.NodeID, w.nodeID.Uint64()).
 							Str(zf.Reason, w.changes[0].Reason).
 							Msg("failed to generate map response for synchronous work")
-					} else if result.mapResponse != nil {
-						nc.updateSentPeers(result.mapResponse)
 					}
+					// Peer tracking is recorded by the caller (AddNode) only
+					// after the initial map is actually delivered; recording it
+					// here, before delivery, would leave phantom lastSentPeers
+					// if the send times out.
 
 					nc.workMu.Unlock()
 				} else {
@@ -524,6 +544,9 @@ func (b *Batcher) worker(workerID int) {
 					}
 				}
 				nc.workMu.Unlock()
+
+				// Bundle delivered; allow the next tick's bundle to queue.
+				nc.inFlight.Store(false)
 			}
 		case <-b.done:
 			wlog.Debug().Msg("batcher shutting down, exiting worker")
@@ -625,6 +648,14 @@ func (b *Batcher) processBatchedChanges() {
 			return true
 		}
 
+		// Only one batched bundle per node may be in flight at a time. If the
+		// previous tick's bundle is still queued or processing, leave this
+		// tick's changes in pending; they are picked up once it completes. This
+		// keeps delivery ordered even when the worker pool is saturated.
+		if nc.inFlight.Load() {
+			return true
+		}
+
 		pending := nc.drainPending()
 		if len(pending) == 0 {
 			return true
@@ -634,8 +665,7 @@ func (b *Batcher) processBatchedChanges() {
 		pending = change.DedupePolicyChanges(pending)
 
 		// Queue a single work item containing all pending changes.
-		// One item per node ensures a single worker processes them
-		// sequentially, preventing out-of-order delivery.
+		nc.inFlight.Store(true)
 		b.queueWork(work{changes: pending, nodeID: nodeID, resultCh: nil})
 
 		return true

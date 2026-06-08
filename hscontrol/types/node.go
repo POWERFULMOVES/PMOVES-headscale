@@ -363,11 +363,21 @@ func (node *Node) AppendToIPSet(build *netipx.IPSetBuilder) {
 // matching node2's IPs, node2's approved subnet routes, or "the
 // internet" when node2 is an exit node — grants access.
 func (node *Node) CanAccess(matchers []matcher.Match, node2 *Node) bool {
+	return node.canAccess(matchers, node2, node.SubnetRoutes(), node2.SubnetRoutes(), node2.IsExitNode())
+}
+
+// canAccess is [Node.CanAccess] with the snapshot-stable route data supplied by
+// the caller. The peer-map build precomputes each node's SubnetRoutes and
+// exit-node status once and passes them here, so the O(n^2) pair scan does not
+// recompute them for every pair.
+func (node *Node) canAccess(
+	matchers []matcher.Match,
+	node2 *Node,
+	srcRoutes, dstRoutes []netip.Prefix,
+	dstIsExit bool,
+) bool {
 	src := node.IPs()
 	allowedIPs := node2.IPs()
-	srcRoutes := node.SubnetRoutes()
-	dstRoutes := node2.SubnetRoutes()
-	dstIsExit := node2.IsExitNode()
 
 	for _, m := range matchers {
 		srcMatchesIP := m.SrcsContainsIPs(src...)
@@ -735,19 +745,21 @@ func (node *Node) ApplyPeerChange(change *tailcfg.PeerChange) {
 	// This might technically not be useful as we replace
 	// the whole hostinfo blob when it has changed.
 	if change.DERPRegion != 0 {
-		if node.Hostinfo == nil {
-			node.Hostinfo = &tailcfg.Hostinfo{
-				NetInfo: &tailcfg.NetInfo{
-					PreferredDERP: change.DERPRegion,
-				},
-			}
-		} else if node.Hostinfo.NetInfo == nil {
-			node.Hostinfo.NetInfo = &tailcfg.NetInfo{
-				PreferredDERP: change.DERPRegion,
-			}
-		} else {
-			node.Hostinfo.NetInfo.PreferredDERP = change.DERPRegion
+		// [NodeStore] publishes snapshots that share the *Hostinfo /
+		// *NetInfo pointers, so writing PreferredDERP in place would race
+		// readers of an already-published snapshot. Clone to fresh pointers
+		// and assign, leaving the previous snapshot untouched.
+		hi := node.Hostinfo.Clone()
+		if hi == nil {
+			hi = &tailcfg.Hostinfo{}
 		}
+
+		if hi.NetInfo == nil {
+			hi.NetInfo = &tailcfg.NetInfo{}
+		}
+
+		hi.NetInfo.PreferredDERP = change.DERPRegion
+		node.Hostinfo = hi
 	}
 
 	node.LastSeen = change.LastSeen
@@ -860,6 +872,21 @@ func (nv NodeView) CanAccess(matchers []matcher.Match, node2 NodeView) bool {
 	}
 
 	return nv.ж.CanAccess(matchers, node2.ж)
+}
+
+// CanAccessWithRoutes is [NodeView.CanAccess] with precomputed route data, used
+// by the peer-map build to avoid recomputing each node's routes per pair.
+func (nv NodeView) CanAccessWithRoutes(
+	matchers []matcher.Match,
+	node2 NodeView,
+	srcRoutes, dstRoutes []netip.Prefix,
+	dstIsExit bool,
+) bool {
+	if !nv.Valid() || !node2.Valid() {
+		return false
+	}
+
+	return nv.ж.canAccess(matchers, node2.ж, srcRoutes, dstRoutes, dstIsExit)
 }
 
 func (nv NodeView) CanAccessRoute(matchers []matcher.Match, route netip.Prefix) bool {

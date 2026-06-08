@@ -2,6 +2,7 @@ package db
 
 import (
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -87,6 +89,82 @@ func TestEphemeralGarbageCollectorGoRoutineLeak(t *testing.T) {
 	}, time.Second, 10*time.Millisecond, "goroutines should clean up after GC close")
 
 	t.Logf("Final number of goroutines: %d", runtime.NumGoroutine())
+}
+
+// TestEphemeralGarbageCollectorCancelReapsGoroutine verifies that Cancel (and
+// reschedule) reaps the per-node watcher goroutine while the collector is still
+// running, rather than leaking it until Close. The production churn path is an
+// ephemeral node disconnecting (Schedule) then reconnecting (Cancel) before the
+// long expiry timer fires; a stopped timer never fires, so a watcher parked
+// only on <-timer.C would otherwise leak on every cycle.
+func TestEphemeralGarbageCollectorCancelReapsGoroutine(t *testing.T) {
+	gc := NewEphemeralGarbageCollector(func(types.NodeID) {})
+
+	go gc.Start()
+	defer gc.Close()
+
+	baseline := runtime.NumGoroutine()
+
+	const (
+		iterations = 1000
+		nodeID     = types.NodeID(42)
+	)
+
+	for range iterations {
+		gc.Schedule(nodeID, time.Hour) // disconnect: long timer, will not fire
+		gc.Cancel(nodeID)              // reconnect: must reap the watcher
+	}
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.LessOrEqual(c, runtime.NumGoroutine(), baseline+10,
+			"per-node goroutines leaked on Cancel/reschedule")
+	}, 2*time.Second, 20*time.Millisecond, "watcher goroutines should be reaped")
+}
+
+// TestEphemeralGarbageCollectorCancelBeatsQueuedDeletion verifies that a node
+// reconnecting (Cancel) after its deletion has already been queued on the
+// internal channel is not deleted. The timer fires and enqueues the deletion;
+// Cancel then runs before Start drains it. Start must drop the now-superseded
+// deletion rather than removing the freshly reconnected node.
+func TestEphemeralGarbageCollectorCancelBeatsQueuedDeletion(t *testing.T) {
+	const targetNode types.NodeID = 42
+
+	var (
+		mu      sync.Mutex
+		deleted []types.NodeID
+	)
+
+	e := NewEphemeralGarbageCollector(func(ni types.NodeID) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		deleted = append(deleted, ni)
+	})
+
+	// Schedule with a tiny expiry but do not drain yet: the watcher fires and
+	// enqueues the deletion onto the buffered channel.
+	e.Schedule(targetNode, time.Millisecond)
+	require.Eventually(t, func() bool {
+		return len(e.deleteCh) == 1
+	}, time.Second, time.Millisecond, "deletion should be queued")
+
+	// Node reconnects before the queue is drained.
+	e.Cancel(targetNode)
+
+	go e.Start()
+	defer e.Close()
+
+	require.Eventually(t, func() bool {
+		return len(e.deleteCh) == 0
+	}, time.Second, time.Millisecond, "Start should drain the queued deletion")
+
+	assert.Never(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return slices.Contains(deleted, targetNode)
+	}, 200*time.Millisecond, 10*time.Millisecond,
+		"cancelled node must not be deleted")
 }
 
 // TestEphemeralGarbageCollectorReschedule is a test for the rescheduling of nodes in [EphemeralGarbageCollector].
