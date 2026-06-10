@@ -84,7 +84,6 @@ type noiseServer struct {
 	http2Server    *http2.Server
 	conn           *controlbase.Conn
 	machineKey     key.MachinePublic
-	nodeKey        key.NodePublic
 
 	// [tailcfg.EarlyNoise]-related stuff
 	challenge       key.ChallengePrivate
@@ -611,6 +610,19 @@ func (ns *noiseServer) sshActionFollowUp(
 
 	auth, ok := ns.headscale.state.GetAuthCacheEntry(authID)
 	if !ok {
+		// The session is gone (expired, evicted, or lost on a control-plane
+		// restart). A bare error dead-ends the client: it keeps polling this
+		// now-defunct auth_id until the SSH connection times out. Re-delegate
+		// so a still-required check can complete instead.
+		if checkFound {
+			reqLog.Info().Caller().
+				Msg("SSH check auth session missing; re-delegating")
+
+			return ns.sshActionHoldAndDelegate(
+				reqLog, action, srcNodeID, dstNodeID,
+			)
+		}
+
 		return nil, NewHTTPError(
 			http.StatusBadRequest,
 			"Invalid auth_id",
@@ -716,8 +728,6 @@ func (ns *noiseServer) PollNetMapHandler(
 		return
 	}
 
-	ns.nodeKey = nv.NodeKey()
-
 	sess := ns.headscale.newMapSession(req.Context(), mapRequest, writer, nv.AsStruct())
 	sess.log.Trace().Caller().Msg("a node sending a MapRequest with Noise protocol")
 
@@ -752,8 +762,6 @@ func (ns *noiseServer) RegistrationHandler(
 		if err != nil {
 			return &regReq, regErr(err)
 		}
-
-		ns.nodeKey = regReq.NodeKey
 
 		resp, err = ns.headscale.handleRegister(req.Context(), regReq, ns.conn.Peer())
 		if err != nil {

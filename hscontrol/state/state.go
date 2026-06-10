@@ -112,6 +112,11 @@ var nodeUpdateColumns = []string{
 // ErrRegistrationExpired is returned when a registration has expired.
 var ErrRegistrationExpired = errors.New("registration expired")
 
+// ErrNodeKeyInUse is returned when a registration or re-auth claims a NodeKey
+// already bound to a different machine, enforcing the 1:1 NodeKey<->MachineKey
+// binding.
+var ErrNodeKeyInUse = errors.New("node key already in use by another machine")
+
 // sshCheckPair identifies a (source, destination) node pair for
 // SSH check auth tracking.
 type sshCheckPair struct {
@@ -523,6 +528,7 @@ func (s *State) persistNodeRowToDB(node types.NodeView) (types.NodeView, error) 
 	// SetNodeExpiry calls or re-registration, not during MapRequest updates.
 	err := s.db.DB.Select(nodeUpdateColumns).Omit("Expiry").Updates(nodePtr).Error
 	s.persistMu.Unlock()
+
 	if err != nil {
 		return types.NodeView{}, fmt.Errorf("saving node: %w", err)
 	}
@@ -809,8 +815,9 @@ func (s *State) ListPeers(nodeID types.NodeID, peerIDs ...types.NodeID) views.Sl
 	// For specific peerIDs, filter from all nodes.
 	// This path is used for incremental updates (NodeAdded, NodeChanged)
 	// where the caller already knows which peer IDs are involved.
-	// The peer visibility filtering happens in the mapper's buildTailPeers
-	// via MatchersForNode/ReduceNodes.
+	// Peer visibility filtering happens in the mapper against the live
+	// policy (buildTailPeers and the shared visiblePeerIDs filter), because
+	// the snapshot peer map is not rebuilt on policy changes.
 	allNodes := s.nodeStore.ListNodes()
 
 	nodeIDSet := make(map[types.NodeID]struct{}, len(peerIDs))
@@ -1443,6 +1450,14 @@ func (s *State) SetAuthCacheEntry(id types.AuthID, entry *types.AuthRequest) {
 	s.authCache.Add(id, entry)
 }
 
+// DeleteAuthCacheEntryForTest drops a pending auth request from the cache,
+// exposed for testing so a test can reproduce a session that was lost
+// (expired, evicted, or dropped on a control-plane restart) without faking an
+// auth_id.
+func (s *State) DeleteAuthCacheEntryForTest(id types.AuthID) {
+	s.authCache.Remove(id)
+}
+
 // SetLastSSHAuth records a successful SSH check authentication
 // for the given (src, dst) node pair.
 func (s *State) SetLastSSHAuth(src, dst types.NodeID) {
@@ -1561,6 +1576,17 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 			ErrRequestedTagsInvalidOrNotPermitted,
 			rejectedTags,
 		)
+	}
+
+	// Re-auth rotates the NodeKey to the client-supplied value. Enforce the
+	// same 1:1 NodeKey<->MachineKey binding createAndSaveNewNode applies at
+	// registration and getAndValidateNode enforces at poll time: a NodeKey
+	// already bound to a different machine must not be claimed here, or a
+	// re-authenticating node could rotate its key to a victim's and poison
+	// the NodeStore NodeKey index (denying the victim service).
+	if existing, ok := s.nodeStore.GetNodeByNodeKey(regData.NodeKey); ok &&
+		existing.MachineKey() != regData.MachineKey {
+		return types.NodeView{}, ErrNodeKeyInUse
 	}
 
 	// Update existing node in [NodeStore] - validation passed, safe to mutate
@@ -1688,6 +1714,20 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 			types.NodeID(0),
 			params.Hostinfo,
 		)
+	}
+
+	// Enforce NodeKey uniqueness across machines. NodeKeys are public
+	// (peers learn them from the netmap), so an authenticated party could
+	// otherwise register a node carrying a victim's NodeKey, poisoning the
+	// NodeStore NodeKey index so the victim's MapRequest resolves to the
+	// wrong node and is rejected by getAndValidateNode's MachineKey check
+	// (a DoS). createAndSaveNewNode only runs for a machine that has no
+	// existing node, so any current holder of this NodeKey is a different
+	// machine; mirror the 1:1 binding getAndValidateNode enforces at poll
+	// time and reject before allocating any resources.
+	if existing, ok := s.nodeStore.GetNodeByNodeKey(params.NodeKey); ok &&
+		existing.MachineKey() != params.MachineKey {
+		return types.NodeView{}, ErrNodeKeyInUse
 	}
 
 	// Prepare the node for registration
