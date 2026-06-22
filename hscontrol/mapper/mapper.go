@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"maps"
 	"net/url"
 	"os"
 	"path"
@@ -51,12 +52,6 @@ type mapper struct {
 	created time.Time
 }
 
-//nolint:unused
-type patch struct {
-	timestamp time.Time
-	change    *tailcfg.PeerChange
-}
-
 func newMapper(
 	cfg *types.Config,
 	state *state.State,
@@ -76,7 +71,6 @@ func generateUserProfiles(
 	peers views.Slice[types.NodeView],
 ) []tailcfg.UserProfile {
 	userMap := make(map[uint]*types.UserView)
-	ids := make([]uint, 0, len(userMap))
 
 	user := node.Owner()
 	if !user.Valid() {
@@ -87,9 +81,7 @@ func generateUserProfiles(
 		return nil
 	}
 
-	userID := user.Model().ID
-	userMap[userID] = &user
-	ids = append(ids, userID)
+	userMap[user.Model().ID] = &user
 
 	for _, peer := range peers.All() {
 		peerUser := peer.Owner()
@@ -97,20 +89,13 @@ func generateUserProfiles(
 			continue
 		}
 
-		peerUserID := peerUser.Model().ID
-		userMap[peerUserID] = &peerUser
-		ids = append(ids, peerUserID)
+		userMap[peerUser.Model().ID] = &peerUser
 	}
-
-	slices.Sort(ids)
-	ids = slices.Compact(ids)
 
 	var profiles []tailcfg.UserProfile
 
-	for _, id := range ids {
-		if userMap[id] != nil {
-			profiles = append(profiles, userMap[id].TailscaleUserProfile())
-		}
+	for _, id := range slices.Sorted(maps.Keys(userMap)) {
+		profiles = append(profiles, userMap[id].TailscaleUserProfile())
 	}
 
 	return profiles
@@ -505,15 +490,9 @@ func (m *mapper) filterVisiblePeerPatches(
 		return nil
 	}
 
-	var filtered []*tailcfg.PeerChange
-
-	for _, patch := range patches {
-		if _, vis := visible[patch.NodeID]; vis {
-			filtered = append(filtered, patch)
-		}
-	}
-
-	return filtered
+	return filterByVisible(visible, patches, func(p *tailcfg.PeerChange) tailcfg.NodeID {
+		return p.NodeID
+	})
 }
 
 // filterVisibleNodes restricts a peer slice to the nodes the recipient can see
@@ -530,15 +509,27 @@ func (m *mapper) filterVisibleNodes(
 		return views.SliceOf([]types.NodeView{})
 	}
 
-	var filtered []types.NodeView
+	return views.SliceOf(filterByVisible(visible, peers.AsSlice(), func(p types.NodeView) tailcfg.NodeID {
+		return p.ID().NodeID()
+	}))
+}
 
-	for _, peer := range peers.All() {
-		if _, vis := visible[peer.ID().NodeID()]; vis {
-			filtered = append(filtered, peer)
+// filterByVisible keeps only the items whose key resolves to a NodeID present
+// in the visible set, preserving input order.
+func filterByVisible[T any](
+	visible map[tailcfg.NodeID]struct{},
+	items []T,
+	key func(T) tailcfg.NodeID,
+) []T {
+	var filtered []T
+
+	for _, it := range items {
+		if _, ok := visible[key(it)]; ok {
+			filtered = append(filtered, it)
 		}
 	}
 
-	return views.SliceOf(filtered)
+	return filtered
 }
 
 func writeDebugMapResponse(

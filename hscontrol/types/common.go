@@ -11,8 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/juanfont/headscale/hscontrol/util"
-	"tailscale.com/tailcfg"
+	"tailscale.com/util/rands"
 )
 
 const (
@@ -28,139 +27,6 @@ var (
 	ErrInvalidAuthIDPrefix = errors.New("auth ID has invalid prefix")
 )
 
-type StateUpdateType int
-
-func (su StateUpdateType) String() string {
-	switch su {
-	case StateFullUpdate:
-		return "StateFullUpdate"
-	case StatePeerChanged:
-		return "StatePeerChanged"
-	case StatePeerChangedPatch:
-		return "StatePeerChangedPatch"
-	case StatePeerRemoved:
-		return "StatePeerRemoved"
-	case StateSelfUpdate:
-		return "StateSelfUpdate"
-	case StateDERPUpdated:
-		return "StateDERPUpdated"
-	}
-
-	return "unknown state update type"
-}
-
-const (
-	StateFullUpdate StateUpdateType = iota
-	// StatePeerChanged is used for updates that needs
-	// to be calculated with all peers and all policy rules.
-	// This would typically be things that include tags, routes
-	// and similar.
-	StatePeerChanged
-	StatePeerChangedPatch
-	StatePeerRemoved
-	// StateSelfUpdate is used to indicate that the node
-	// has changed in control, and the client needs to be
-	// informed.
-	// The updated node is inside the ChangeNodes field
-	// which should have a length of one.
-	StateSelfUpdate
-	StateDERPUpdated
-)
-
-// StateUpdate is an internal message containing information about
-// a state change that has happened to the network.
-// If type is [StateFullUpdate], all fields are ignored.
-type StateUpdate struct {
-	// The type of update
-	Type StateUpdateType
-
-	// ChangeNodes must be set when Type is StatePeerAdded
-	// and [StatePeerChanged] and contains the full node
-	// object for added nodes.
-	ChangeNodes []NodeID
-
-	// ChangePatches must be set when Type is [StatePeerChangedPatch]
-	// and contains a populated [tailcfg.PeerChange] object.
-	ChangePatches []*tailcfg.PeerChange
-
-	// Removed must be set when Type is [StatePeerRemoved] and
-	// contain a list of the nodes that has been removed from
-	// the network.
-	Removed []NodeID
-
-	// DERPMap must be set when Type is [StateDERPUpdated] and
-	// contain the new DERP Map.
-	DERPMap *tailcfg.DERPMap
-
-	// Additional message for tracking origin or what being
-	// updated, useful for ambiguous updates like [StatePeerChanged].
-	Message string
-}
-
-// Empty reports if there are any updates in the [StateUpdate].
-func (su *StateUpdate) Empty() bool {
-	switch su.Type {
-	case StatePeerChanged:
-		return len(su.ChangeNodes) == 0
-	case StatePeerChangedPatch:
-		return len(su.ChangePatches) == 0
-	case StatePeerRemoved:
-		return len(su.Removed) == 0
-	case StateFullUpdate, StateSelfUpdate, StateDERPUpdated:
-		// These update types don't have associated data to check,
-		// so they are never considered empty.
-		return false
-	}
-
-	return false
-}
-
-func UpdateFull() StateUpdate {
-	return StateUpdate{
-		Type: StateFullUpdate,
-	}
-}
-
-func UpdateSelf(nodeID NodeID) StateUpdate {
-	return StateUpdate{
-		Type:        StateSelfUpdate,
-		ChangeNodes: []NodeID{nodeID},
-	}
-}
-
-func UpdatePeerChanged(nodeIDs ...NodeID) StateUpdate {
-	return StateUpdate{
-		Type:        StatePeerChanged,
-		ChangeNodes: nodeIDs,
-	}
-}
-
-func UpdatePeerPatch(changes ...*tailcfg.PeerChange) StateUpdate {
-	return StateUpdate{
-		Type:          StatePeerChangedPatch,
-		ChangePatches: changes,
-	}
-}
-
-func UpdatePeerRemoved(nodeIDs ...NodeID) StateUpdate {
-	return StateUpdate{
-		Type:    StatePeerRemoved,
-		Removed: nodeIDs,
-	}
-}
-
-func UpdateExpire(nodeID NodeID, expiry time.Time) StateUpdate {
-	return StateUpdate{
-		Type: StatePeerChangedPatch,
-		ChangePatches: []*tailcfg.PeerChange{
-			{
-				NodeID:    nodeID.NodeID(),
-				KeyExpiry: &expiry,
-			},
-		},
-	}
-}
-
 const (
 	authIDPrefix       = "hskey-authreq-"
 	authIDRandomLength = 24
@@ -171,12 +37,7 @@ const (
 type AuthID string
 
 func NewAuthID() (AuthID, error) {
-	rid, err := util.GenerateRandomStringURLSafe(authIDRandomLength)
-	if err != nil {
-		return "", err
-	}
-
-	return AuthID(authIDPrefix + rid), nil
+	return AuthID(authIDPrefix + rands.HexString(authIDRandomLength)), nil
 }
 
 func MustAuthID() AuthID {
@@ -375,10 +236,7 @@ func (rn *AuthRequest) FinishAuth(verdict AuthVerdict) {
 		return
 	}
 
-	select {
-	case rn.finished <- verdict:
-	default:
-	}
+	rn.finished <- verdict
 
 	close(rn.finished)
 }

@@ -412,6 +412,38 @@ tls_letsencrypt_challenge_type: TLS-ALPN-01
 	require.NoError(t, err)
 }
 
+func TestPKCEMethodValidation(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// OIDC is active (issuer set) with PKCE enabled and an invalid method.
+	// There is no oidc.enabled key. validateServerConfig must reject the
+	// invalid method rather than silently skipping the check.
+	configYaml := []byte(`---
+noise:
+  private_key_path: noise_private.key
+server_url: http://127.0.0.1:8080
+dns:
+  override_local_dns: false
+oidc:
+  issuer: https://idp.example.com
+  client_id: headscale
+  pkce:
+    enabled: true
+    method: S256-typo
+`)
+
+	configFilePath := filepath.Join(tmpDir, "config.yaml")
+	err := os.WriteFile(configFilePath, configYaml, 0o600)
+	require.NoError(t, err)
+
+	err = LoadConfig(tmpDir, false)
+	require.NoError(t, err)
+
+	err = validateServerConfig()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), errInvalidPKCEMethod.Error())
+}
+
 // OK
 // server_url: headscale.com, base: clients.headscale.com
 // server_url: headscale.com, base: headscale.net
@@ -457,6 +489,47 @@ func TestSafeServerURL(t *testing.T) {
 		{
 			serverURL: "http://foo\x00",
 			wantErr:   `parse "http://foo\x00": net/url: invalid control character in URL`,
+		},
+	}
+
+	for _, tt := range tests {
+		testName := fmt.Sprintf("server=%s domain=%s", tt.serverURL, tt.baseDomain)
+		t.Run(testName, func(t *testing.T) {
+			err := isSafeServerURL(tt.serverURL, tt.baseDomain)
+			if tt.wantErr != "" {
+				assert.EqualError(t, err, tt.wantErr)
+
+				return
+			}
+
+			assert.NoError(t, err)
+		})
+	}
+}
+
+func TestSafeServerURLWithPort(t *testing.T) {
+	tests := []struct {
+		serverURL, baseDomain,
+		wantErr string
+	}{
+		{
+			serverURL:  "https://server.headscale.com:443",
+			baseDomain: "headscale.com",
+			wantErr:    errServerURLSuffix.Error(),
+		},
+		{
+			serverURL:  "https://server.subdomain.headscale.com:8080",
+			baseDomain: "headscale.com",
+			wantErr:    errServerURLSuffix.Error(),
+		},
+		{
+			serverURL:  "https://headscale.com:443",
+			baseDomain: "headscale.com",
+			wantErr:    errServerURLSame.Error(),
+		},
+		{
+			serverURL:  "https://example.com:8080",
+			baseDomain: "example.org",
 		},
 	}
 

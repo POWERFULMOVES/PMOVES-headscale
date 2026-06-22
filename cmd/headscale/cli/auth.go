@@ -3,8 +3,9 @@ package cli
 import (
 	"context"
 	"fmt"
+	"net/http"
 
-	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	clientv1 "github.com/juanfont/headscale/gen/client/v1"
 	"github.com/spf13/cobra"
 )
 
@@ -33,61 +34,66 @@ var authCmd = &cobra.Command{
 var authRegisterCmd = &cobra.Command{
 	Use:   "register",
 	Short: "Register a node to your network",
-	RunE: grpcRunE(func(ctx context.Context, client v1.HeadscaleServiceClient, cmd *cobra.Command, args []string) error {
+	RunE: clientRunE(func(ctx context.Context, client *clientv1.ClientWithResponses, cmd *cobra.Command, args []string) error {
 		user, _ := cmd.Flags().GetString("user")
 		authID, _ := cmd.Flags().GetString("auth-id")
 
-		request := &v1.AuthRegisterRequest{
-			AuthId: authID,
-			User:   user,
-		}
-
-		response, err := client.AuthRegister(ctx, request)
+		resp, err := client.AuthRegisterWithResponse(ctx, clientv1.AuthRegisterJSONRequestBody{
+			AuthId: &authID,
+			User:   &user,
+		})
 		if err != nil {
 			return fmt.Errorf("registering node: %w", err)
 		}
 
+		if resp.StatusCode() != http.StatusOK {
+			return apiError(resp.StatusCode(), resp.ApplicationproblemJSONDefault)
+		}
+
+		node := resp.JSON200.Node
+
 		return printOutput(
 			cmd,
-			response.GetNode(),
-			fmt.Sprintf("Node %s registered", response.GetNode().GetGivenName()))
+			node,
+			fmt.Sprintf("Node %s registered", node.GivenName),
+		)
 	}),
 }
 
 var authApproveCmd = &cobra.Command{
 	Use:   "approve",
 	Short: "Approve a pending authentication request",
-	RunE: grpcRunE(func(ctx context.Context, client v1.HeadscaleServiceClient, cmd *cobra.Command, args []string) error {
+	RunE: clientRunE(func(ctx context.Context, client *clientv1.ClientWithResponses, cmd *cobra.Command, args []string) error {
 		authID, _ := cmd.Flags().GetString("auth-id")
 
-		request := &v1.AuthApproveRequest{
-			AuthId: authID,
-		}
-
-		response, err := client.AuthApprove(ctx, request)
+		resp, err := client.AuthApproveWithResponse(ctx, clientv1.AuthApproveJSONRequestBody{AuthId: &authID})
 		if err != nil {
 			return fmt.Errorf("approving auth request: %w", err)
 		}
 
-		return printOutput(cmd, response, "Auth request approved")
+		if resp.StatusCode() != http.StatusOK {
+			return apiError(resp.StatusCode(), resp.ApplicationproblemJSONDefault)
+		}
+
+		return printOutput(cmd, resp.JSON200, "Auth request approved")
 	}),
 }
 
 var authRejectCmd = &cobra.Command{
 	Use:   "reject",
 	Short: "Reject a pending authentication request",
-	RunE: grpcRunE(func(ctx context.Context, client v1.HeadscaleServiceClient, cmd *cobra.Command, args []string) error {
+	RunE: clientRunE(func(ctx context.Context, client *clientv1.ClientWithResponses, cmd *cobra.Command, args []string) error {
 		authID, _ := cmd.Flags().GetString("auth-id")
 
-		request := &v1.AuthRejectRequest{
-			AuthId: authID,
-		}
-
-		response, err := client.AuthReject(ctx, request)
+		resp, err := client.AuthRejectWithResponse(ctx, clientv1.AuthRejectJSONRequestBody{AuthId: &authID})
 		if err != nil {
 			return fmt.Errorf("rejecting auth request: %w", err)
 		}
 
-		return printOutput(cmd, response, "Auth request rejected")
+		if resp.StatusCode() != http.StatusOK {
+			return apiError(resp.StatusCode(), resp.ApplicationproblemJSONDefault)
+		}
+
+		return printOutput(cmd, resp.JSON200, "Auth request rejected")
 	}),
 }

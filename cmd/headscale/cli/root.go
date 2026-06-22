@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -95,13 +96,9 @@ func initConfig() {
 var prereleases = []string{"alpha", "beta", "rc", "dev"}
 
 func isPreReleaseVersion(version string) bool {
-	for _, unstable := range prereleases {
-		if strings.Contains(version, unstable) {
-			return true
-		}
-	}
-
-	return false
+	return slices.ContainsFunc(prereleases, func(unstable string) bool {
+		return strings.Contains(version, unstable)
+	})
 }
 
 // filterPreReleasesIfStable returns a function that filters out
@@ -120,13 +117,7 @@ func filterPreReleasesIfStable(versionFunc func() string) func(string) bool {
 		}
 
 		// If we are on a stable release, filter out pre-releases.
-		for _, ignore := range prereleases {
-			if strings.Contains(tag, ignore) {
-				return true
-			}
-		}
-
-		return false
+		return isPreReleaseVersion(tag)
 	}
 }
 

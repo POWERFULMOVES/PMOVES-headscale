@@ -5,6 +5,7 @@
 package servertest
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"net/netip"
@@ -43,6 +44,7 @@ type serverConfig struct {
 	nodeExpiry       time.Duration
 	batcherWorkers   int
 	taildropEnabled  bool
+	realListener     bool
 }
 
 func defaultServerConfig() *serverConfig {
@@ -65,6 +67,13 @@ func WithBufferedChanSize(n int) ServerOption {
 	return func(c *serverConfig) { c.bufferedChanSize = n }
 }
 
+// WithBatcherWorkers sets the number of batcher worker goroutines.
+// Defaults to 1 for deterministic tests; pass
+// [types.DefaultBatcherWorkers] to match production concurrency.
+func WithBatcherWorkers(n int) ServerOption {
+	return func(c *serverConfig) { c.batcherWorkers = n }
+}
+
 // WithEphemeralTimeout sets the ephemeral node inactivity timeout.
 func WithEphemeralTimeout(d time.Duration) ServerOption {
 	return func(c *serverConfig) { c.ephemeralTimeout = d }
@@ -73,6 +82,14 @@ func WithEphemeralTimeout(d time.Duration) ServerOption {
 // WithNodeExpiry sets the default node key expiry duration.
 func WithNodeExpiry(d time.Duration) ServerOption {
 	return func(c *serverConfig) { c.nodeExpiry = d }
+}
+
+// WithRealListener binds the HTTP API to a real loopback TCP port instead of
+// the in-process memnet, so external processes — the Tailscale SDK over a real
+// socket, tscli, OpenTofu — can reach the API. The Noise/[TestClient] control
+// path still uses memnet, so this is for REST/API tests only.
+func WithRealListener() ServerOption {
+	return func(c *serverConfig) { c.realListener = true }
 }
 
 // WithTaildropEnabled toggles the Taildrop file-sharing feature.
@@ -157,13 +174,24 @@ func NewServer(tb testing.TB, opts ...ServerOption) *TestServer {
 	app.StartBatcherForTest(tb)
 	app.StartEphemeralGCForTest(tb)
 
-	// Start the HTTP server over an in-memory network so that all
-	// TCP connections stay in-process.
-	var memNetwork memnet.Network
+	// Start the HTTP server. By default it binds an in-memory network so all
+	// TCP connections stay in-process; WithRealListener swaps in a real loopback
+	// port so external binaries can connect.
+	var (
+		memNetwork memnet.Network
+		ln         net.Listener
+	)
 
-	ln, err := memNetwork.Listen("tcp", "127.0.0.1:443")
+	if sc.realListener {
+		var lc net.ListenConfig
+
+		ln, err = lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	} else {
+		ln, err = memNetwork.Listen("tcp", "127.0.0.1:443")
+	}
+
 	if err != nil {
-		tb.Fatalf("servertest: memnet Listen: %v", err)
+		tb.Fatalf("servertest: Listen: %v", err)
 	}
 
 	httpServer := &http.Server{
@@ -226,43 +254,71 @@ func (s *TestServer) CreateUser(tb testing.TB, name string) *types.User {
 	return u
 }
 
+// CreateAPIKey mints an API key string (the Bearer/Basic credential). When
+// owner is non-nil the key is owned by that user, so the v2 API mints
+// user-owned (untagged) auth keys on its behalf.
+func (s *TestServer) CreateAPIKey(tb testing.TB, owner *types.User) string {
+	tb.Helper()
+
+	keyStr, key, err := s.st.CreateAPIKey(nil)
+	if err != nil {
+		tb.Fatalf("servertest: CreateAPIKey: %v", err)
+	}
+
+	if owner != nil {
+		err := s.st.SetAPIKeyUser(key.ID, types.UserID(owner.ID))
+		if err != nil {
+			tb.Fatalf("servertest: SetAPIKeyUser: %v", err)
+		}
+	}
+
+	return keyStr
+}
+
+// CreateRegisteredNode mints a registered node (allocated IPs, registered
+// method) in BOTH the database and the in-memory NodeStore, then returns its
+// view. The v2 device endpoints resolve nodes via State.GetNodeByID, which reads
+// the NodeStore, so a DB-only node would be invisible to them.
+func (s *TestServer) CreateRegisteredNode(tb testing.TB, owner *types.User, hostname ...string) types.NodeView {
+	tb.Helper()
+
+	node := s.st.CreateRegisteredNodeForTest(owner, hostname...)
+	// CreateRegisteredNodeForTest sets UserID but leaves the User association
+	// unloaded; the device response renders the owner login, so attach it.
+	node.User = owner
+
+	return s.st.PutNodeInStoreForTest(*node)
+}
+
 // CreatePreAuthKey creates a reusable pre-auth key for the given user.
 func (s *TestServer) CreatePreAuthKey(tb testing.TB, userID types.UserID) string {
 	tb.Helper()
-
-	uid := userID
-
-	pak, err := s.st.CreatePreAuthKey(&uid, true, false, nil, nil)
-	if err != nil {
-		tb.Fatalf("servertest: CreatePreAuthKey: %v", err)
-	}
-
-	return pak.Key
+	return s.createPreAuthKey(tb, userID, true, false, nil)
 }
 
 // CreateTaggedPreAuthKey creates a reusable pre-auth key with ACL tags.
 func (s *TestServer) CreateTaggedPreAuthKey(tb testing.TB, userID types.UserID, tags []string) string {
 	tb.Helper()
-
-	uid := userID
-
-	pak, err := s.st.CreatePreAuthKey(&uid, true, false, nil, tags)
-	if err != nil {
-		tb.Fatalf("servertest: CreateTaggedPreAuthKey: %v", err)
-	}
-
-	return pak.Key
+	return s.createPreAuthKey(tb, userID, true, false, tags)
 }
 
 // CreateEphemeralPreAuthKey creates an ephemeral pre-auth key.
 func (s *TestServer) CreateEphemeralPreAuthKey(tb testing.TB, userID types.UserID) string {
 	tb.Helper()
+	return s.createPreAuthKey(tb, userID, false, true, nil)
+}
 
-	uid := userID
+func (s *TestServer) createPreAuthKey(
+	tb testing.TB,
+	userID types.UserID,
+	reusable, ephemeral bool,
+	tags []string,
+) string {
+	tb.Helper()
 
-	pak, err := s.st.CreatePreAuthKey(&uid, false, true, nil, nil)
+	pak, err := s.st.CreatePreAuthKey(&userID, reusable, ephemeral, nil, tags)
 	if err != nil {
-		tb.Fatalf("servertest: CreateEphemeralPreAuthKey: %v", err)
+		tb.Fatalf("servertest: createPreAuthKey: %v", err)
 	}
 
 	return pak.Key

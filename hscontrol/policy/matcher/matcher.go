@@ -52,13 +52,7 @@ func MatchesFromFilterRules(rules []tailcfg.FilterRule) []Match {
 // [policy.ReduceNodes], hiding the cap target
 // from the source unless a companion IP-level rule also exists.
 func MatchFromFilterRule(rule tailcfg.FilterRule) Match {
-	srcs := new(netipx.IPSetBuilder)
 	dests := new(netipx.IPSetBuilder)
-
-	for _, srcIP := range rule.SrcIPs {
-		set, _ := util.ParseIPSet(srcIP, nil)
-		srcs.AddSet(set)
-	}
 
 	for _, dp := range rule.DstPorts {
 		set, _ := util.ParseIPSet(dp.IP, nil)
@@ -71,45 +65,29 @@ func MatchFromFilterRule(rule tailcfg.FilterRule) Match {
 		}
 	}
 
-	srcsSet, _ := srcs.IPSet()
 	destsSet, _ := dests.IPSet()
 
 	return Match{
-		srcs:  srcsSet,
+		srcs:  buildIPSet(rule.SrcIPs),
 		dests: destsSet,
 	}
 }
 
-// MatchFromStrings builds a [Match] from raw source and destination
-// strings. Unparseable entries are silently dropped (fail-open): the
-// resulting [Match] is narrower than the input described, but never
-// wider. Callers that need strict validation should pre-validate
-// their inputs via [util.ParseIPSet].
-func MatchFromStrings(sources, destinations []string) Match {
-	srcs := new(netipx.IPSetBuilder)
-	dests := new(netipx.IPSetBuilder)
+// buildIPSet parses each string via [util.ParseIPSet] and unions the
+// results into a single [netipx.IPSet]. Unparseable entries are silently
+// dropped (fail-open): the result is narrower than the input described,
+// but never wider.
+func buildIPSet(addrs []string) *netipx.IPSet {
+	builder := new(netipx.IPSetBuilder)
 
-	for _, srcIP := range sources {
-		set, _ := util.ParseIPSet(srcIP, nil)
-
-		srcs.AddSet(set)
+	for _, addr := range addrs {
+		set, _ := util.ParseIPSet(addr, nil)
+		builder.AddSet(set)
 	}
 
-	for _, dest := range destinations {
-		set, _ := util.ParseIPSet(dest, nil)
+	set, _ := builder.IPSet()
 
-		dests.AddSet(set)
-	}
-
-	srcsSet, _ := srcs.IPSet()
-	destsSet, _ := dests.IPSet()
-
-	match := Match{
-		srcs:  srcsSet,
-		dests: destsSet,
-	}
-
-	return match
+	return set
 }
 
 func (m *Match) SrcsContainsIPs(ips ...netip.Addr) bool {
@@ -142,12 +120,5 @@ func (m *Match) DestsIsTheInternet() bool {
 
 	// Superset-of-[util.TheInternet] check handles merged filter rules
 	// where the internet prefixes are combined with other dests.
-	theInternet := util.TheInternet()
-	for _, prefix := range theInternet.Prefixes() {
-		if !m.dests.ContainsPrefix(prefix) {
-			return false
-		}
-	}
-
-	return true
+	return util.IPSetSubsetOf(util.TheInternet(), m.dests)
 }

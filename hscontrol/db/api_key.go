@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/util"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
+	"tailscale.com/util/rands"
 )
 
 const (
@@ -23,9 +23,9 @@ const (
 )
 
 var (
-	ErrAPIKeyFailedToParse     = errors.New("failed to parse ApiKey")
-	ErrAPIKeyGenerationFailed  = errors.New("failed to generate API key")
-	ErrAPIKeyInvalidGeneration = errors.New("generated API key failed validation")
+	ErrAPIKeyFailedToParse    = errors.New("failed to parse ApiKey")
+	ErrAPIKeyGenerationFailed = errors.New("failed to generate API key")
+	ErrAPIKeyExpired          = errors.New("API key expired")
 )
 
 // CreateAPIKey creates a new [types.APIKey] in a user, and returns it.
@@ -33,34 +33,10 @@ func (hsdb *HSDatabase) CreateAPIKey(
 	expiration *time.Time,
 ) (string, *types.APIKey, error) {
 	// Generate public prefix (12 chars)
-	prefix, err := util.GenerateRandomStringURLSafe(apiKeyPrefixLength)
-	if err != nil {
-		return "", nil, err
-	}
-
-	// Validate prefix
-	if len(prefix) != apiKeyPrefixLength {
-		return "", nil, fmt.Errorf("%w: generated prefix has invalid length: expected %d, got %d", ErrAPIKeyInvalidGeneration, apiKeyPrefixLength, len(prefix))
-	}
-
-	if !isValidBase64URLSafe(prefix) {
-		return "", nil, fmt.Errorf("%w: generated prefix contains invalid characters", ErrAPIKeyInvalidGeneration)
-	}
+	prefix := rands.HexString(apiKeyPrefixLength)
 
 	// Generate secret (64 chars)
-	secret, err := util.GenerateRandomStringURLSafe(apiKeyHashLength)
-	if err != nil {
-		return "", nil, err
-	}
-
-	// Validate secret
-	if len(secret) != apiKeyHashLength {
-		return "", nil, fmt.Errorf("%w: generated secret has invalid length: expected %d, got %d", ErrAPIKeyInvalidGeneration, apiKeyHashLength, len(secret))
-	}
-
-	if !isValidBase64URLSafe(secret) {
-		return "", nil, fmt.Errorf("%w: generated secret contains invalid characters", ErrAPIKeyInvalidGeneration)
-	}
+	secret := rands.HexString(apiKeyHashLength)
 
 	// Full key string (shown ONCE to user)
 	keyStr := apiKeyPrefix + prefix + "-" + secret
@@ -152,6 +128,31 @@ func (hsdb *HSDatabase) ValidateAPIKey(keyStr string) (bool, error) {
 	return true, nil
 }
 
+// AuthenticateAPIKey validates keyStr and returns the matching, unexpired
+// [types.APIKey] (with its owning UserID populated). Unlike ValidateAPIKey it
+// returns the key itself, so the v2 API can act as the key's owning user. A
+// non-nil error means the key is missing, malformed, or expired.
+func (hsdb *HSDatabase) AuthenticateAPIKey(keyStr string) (*types.APIKey, error) {
+	key, err := validateAPIKey(hsdb.DB, keyStr)
+	if err != nil {
+		return nil, err
+	}
+
+	if key.Expiration != nil && key.Expiration.Before(time.Now()) {
+		return nil, ErrAPIKeyExpired
+	}
+
+	return key, nil
+}
+
+// SetAPIKeyUser sets the owning user of an API key. Used when an admin mints a
+// key on behalf of a user (headscale apikeys create --user).
+func (hsdb *HSDatabase) SetAPIKeyUser(keyID uint64, userID types.UserID) error {
+	return hsdb.DB.Model(&types.APIKey{}).
+		Where("id = ?", keyID).
+		Update("user_id", uint(userID)).Error
+}
+
 // ParseAPIKeyPrefix extracts the database prefix from a display prefix.
 // Handles formats: "hskey-api-{12chars}-***", "hskey-api-{12chars}", or just "{12chars}".
 // Returns the 12-character prefix suitable for database lookup.
@@ -205,61 +206,20 @@ func validateAPIKey(db *gorm.DB, keyStr string) (*types.APIKey, error) {
 	}
 
 	// New format: parse and verify
-	const expectedMinLength = apiKeyPrefixLength + 1 + apiKeyHashLength
-	if len(prefixAndSecret) < expectedMinLength {
-		return nil, fmt.Errorf(
-			"%w: key too short, expected at least %d chars after prefix, got %d",
-			ErrAPIKeyFailedToParse,
-			expectedMinLength,
-			len(prefixAndSecret),
-		)
-	}
-
-	// Use fixed-length parsing
-	prefix := prefixAndSecret[:apiKeyPrefixLength]
-
-	// Validate separator at expected position
-	if prefixAndSecret[apiKeyPrefixLength] != '-' {
-		return nil, fmt.Errorf(
-			"%w: expected separator '-' at position %d, got '%c'",
-			ErrAPIKeyFailedToParse,
-			apiKeyPrefixLength,
-			prefixAndSecret[apiKeyPrefixLength],
-		)
-	}
-
-	secret := prefixAndSecret[apiKeyPrefixLength+1:]
-
-	// Validate secret length
-	if len(secret) != apiKeyHashLength {
-		return nil, fmt.Errorf(
-			"%w: secret length mismatch, expected %d chars, got %d",
-			ErrAPIKeyFailedToParse,
-			apiKeyHashLength,
-			len(secret),
-		)
-	}
-
-	// Validate prefix contains only base64 URL-safe characters
-	if !isValidBase64URLSafe(prefix) {
-		return nil, fmt.Errorf(
-			"%w: prefix contains invalid characters (expected base64 URL-safe: A-Za-z0-9_-)",
-			ErrAPIKeyFailedToParse,
-		)
-	}
-
-	// Validate secret contains only base64 URL-safe characters
-	if !isValidBase64URLSafe(secret) {
-		return nil, fmt.Errorf(
-			"%w: secret contains invalid characters (expected base64 URL-safe: A-Za-z0-9_-)",
-			ErrAPIKeyFailedToParse,
-		)
+	prefix, secret, err := parsePrefixedKey(
+		prefixAndSecret,
+		apiKeyPrefixLength,
+		apiKeyHashLength,
+		ErrAPIKeyFailedToParse,
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	// Look up by prefix (indexed)
 	var key types.APIKey
 
-	err := db.First(&key, "prefix = ?", prefix).Error
+	err = db.First(&key, "prefix = ?", prefix).Error
 	if err != nil {
 		return nil, fmt.Errorf("API key not found: %w", err)
 	}

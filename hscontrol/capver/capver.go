@@ -3,11 +3,11 @@ package capver
 //go:generate go run ../../tools/capver/main.go
 
 import (
+	"maps"
 	"slices"
 	"sort"
 	"strings"
 
-	xmaps "golang.org/x/exp/maps"
 	"tailscale.com/tailcfg"
 	"tailscale.com/util/set"
 )
@@ -26,17 +26,7 @@ func CanOldCodeBeCleanedUp() {
 }
 
 func tailscaleVersSorted() []string {
-	vers := xmaps.Keys(tailscaleToCapVer)
-	sort.Strings(vers)
-
-	return vers
-}
-
-func capVersSorted() []tailcfg.CapabilityVersion {
-	capVers := xmaps.Keys(capVerToTailscaleVer)
-	slices.Sort(capVers)
-
-	return capVers
+	return slices.Sorted(maps.Keys(tailscaleToCapVer))
 }
 
 // TailscaleVersion returns the Tailscale version for the given [tailcfg.CapabilityVersion].
@@ -66,21 +56,6 @@ func CapabilityVersion(ver string) tailcfg.CapabilityVersion {
 	return 0
 }
 
-// TailscaleLatest returns the n latest Tailscale versions.
-func TailscaleLatest(n int) []string {
-	if n <= 0 {
-		return nil
-	}
-
-	tsSorted := tailscaleVersSorted()
-
-	if n > len(tsSorted) {
-		return tsSorted
-	}
-
-	return tsSorted[len(tsSorted)-n:]
-}
-
 // TailscaleLatestMajorMinor returns the n latest Tailscale versions (e.g. 1.80).
 func TailscaleLatestMajorMinor(n int, stripV bool) []string {
 	if n <= 0 {
@@ -106,19 +81,4 @@ func TailscaleLatestMajorMinor(n int, stripV bool) []string {
 	}
 
 	return majorSl[len(majorSl)-n:]
-}
-
-// CapVerLatest returns the n latest [tailcfg.CapabilityVersion] values.
-func CapVerLatest(n int) []tailcfg.CapabilityVersion {
-	if n <= 0 {
-		return nil
-	}
-
-	s := capVersSorted()
-
-	if n > len(s) {
-		return s
-	}
-
-	return s[len(s)-n:]
 }

@@ -130,8 +130,8 @@ func GenerateIPv4DNSRootDomain(ipPrefix netip.Prefix) []dnsname.FQDN {
 
 	// here we generate the base domain (e.g., 100.in-addr.arpa., 16.172.in-addr.arpa., etc.)
 	rdnsSlice := []string{}
-	for i := lastOctet - 1; i >= 0; i-- {
-		rdnsSlice = append(rdnsSlice, strconv.FormatUint(uint64(netRange.IP[i]), 10))
+	for _, b := range slices.Backward(netRange.IP[:lastOctet]) {
+		rdnsSlice = append(rdnsSlice, strconv.FormatUint(uint64(b), 10))
 	}
 
 	rdnsSlice = append(rdnsSlice, "in-addr.arpa.")
@@ -150,24 +150,6 @@ func GenerateIPv4DNSRootDomain(ipPrefix netip.Prefix) []dnsname.FQDN {
 	return fqdns
 }
 
-// generateMagicDNSRootDomains generates a list of DNS entries to be included in [tailcfg.DNSConfig.Routes] in [tailcfg.MapResponse].
-// This list of reverse DNS entries instructs the OS on what subnets and domains the Tailscale embedded DNS
-// server (listening in 100.100.100.100 udp/53) should be used for.
-//
-// Tailscale.com includes in the list:
-// - the [types.DNSConfig.BaseDomain] of the user
-// - the reverse DNS entry for IPv6 (0.e.1.a.c.5.1.1.a.7.d.f.ip6.arpa., see below more on IPv6)
-// - the reverse DNS entries for the IPv4 subnets covered by the user's `IPPrefix`.
-//   In the public SaaS this is [64-127].100.in-addr.arpa.
-//
-// The main purpose of this function is then generating the list of IPv4 entries. For the 100.64.0.0/10, this
-// is clear, and could be hardcoded. But we are allowing any range as `IPPrefix`, so we need to find out the
-// subnets when we have 172.16.0.0/16 (i.e., [0-255].16.172.in-addr.arpa.), or any other subnet.
-//
-// How IN-ADDR.ARPA domains work is defined in RFC1035 (section 3.5). Tailscale.com seems to adhere to this,
-// and do not make use of RFC2317 ("Classless IN-ADDR.ARPA delegation") - hence generating the entries for the next
-// class block only.
-
 // GenerateIPv6DNSRootDomain generates the IPv6 reverse DNS root domains.
 // From the netmask we can find out the wildcard bits (the bits that are not set in the netmask).
 // This allows us to then calculate the subnets included in the subsequent class block and generate the entries.
@@ -176,24 +158,18 @@ func GenerateIPv6DNSRootDomain(ipPrefix netip.Prefix) []dnsname.FQDN {
 
 	maskBits, _ := netipx.PrefixIPNet(ipPrefix).Mask.Size()
 	expanded := ipPrefix.Addr().StringExpanded()
-	nibbleStr := strings.Map(func(r rune) rune {
-		if r == ':' {
-			return -1
-		}
-
-		return r
-	}, expanded)
+	nibbleStr := strings.ReplaceAll(expanded, ":", "")
 
 	// TODO?: that does not look the most efficient implementation,
 	// but the inputs are not so long as to cause problems,
 	// and from what I can see, the generateMagicDNSRootDomains
 	// function is called only once over the lifetime of a server process.
-	prefixConstantParts := []string{}
+	prefixConstantParts := make([]string, 0, maskBits/nibbleLen)
 	for i := range maskBits / nibbleLen {
-		prefixConstantParts = append(
-			[]string{string(nibbleStr[i])},
-			prefixConstantParts...)
+		prefixConstantParts = append(prefixConstantParts, string(nibbleStr[i]))
 	}
+
+	slices.Reverse(prefixConstantParts)
 
 	makeDomain := func(variablePrefix ...string) (dnsname.FQDN, error) {
 		prefix := strings.Join(append(variablePrefix, prefixConstantParts...), ".")

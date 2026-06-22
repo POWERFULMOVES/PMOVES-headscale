@@ -1,11 +1,13 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 
-	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	clientv1 "github.com/juanfont/headscale/gen/client/v1"
 	"github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/policy"
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -14,14 +16,13 @@ import (
 )
 
 const (
-	bypassFlag = "bypass-grpc-and-access-database-directly" //nolint:gosec // not a credential
+	bypassFlag = "bypass-server-and-access-database-directly" //nolint:gosec // not a credential
 )
 
 var errAborted = errors.New("command aborted by user")
 
-// bypassDatabase loads the server config and opens the database directly,
-// bypassing the gRPC server. The caller is responsible for closing the
-// returned database handle.
+// bypassDatabase opens the database directly, bypassing the running server.
+// The caller must close the returned handle.
 func bypassDatabase() (*db.HSDatabase, error) {
 	cfg, err := types.LoadServerConfig()
 	if err != nil {
@@ -36,19 +37,29 @@ func bypassDatabase() (*db.HSDatabase, error) {
 	return d, nil
 }
 
+// openBypassDB confirms the destructive bypass action and opens the database
+// directly. The caller is responsible for closing the returned handle.
+func openBypassDB(cmd *cobra.Command) (*db.HSDatabase, error) {
+	if !confirmAction(cmd, "DO NOT run this command if an instance of headscale is running, are you sure headscale is not running?") {
+		return nil, errAborted
+	}
+
+	return bypassDatabase()
+}
+
 func init() {
 	rootCmd.AddCommand(policyCmd)
 
-	getPolicy.Flags().BoolP(bypassFlag, "", false, "Uses the headscale config to directly access the database, bypassing gRPC and does not require the server to be running")
+	getPolicy.Flags().BoolP(bypassFlag, "", false, "Uses the headscale config to directly access the database, bypassing the API and does not require the server to be running")
 	policyCmd.AddCommand(getPolicy)
 
 	setPolicy.Flags().StringP("file", "f", "", "Path to a policy file in HuJSON format")
-	setPolicy.Flags().BoolP(bypassFlag, "", false, "Uses the headscale config to directly access the database, bypassing gRPC and does not require the server to be running")
+	setPolicy.Flags().BoolP(bypassFlag, "", false, "Uses the headscale config to directly access the database, bypassing the API and does not require the server to be running")
 	mustMarkRequired(setPolicy, "file")
 	policyCmd.AddCommand(setPolicy)
 
 	checkPolicy.Flags().StringP("file", "f", "", "Path to a policy file in HuJSON format")
-	checkPolicy.Flags().BoolP(bypassFlag, "", false, "Open the database directly (no gRPC, no running server) to resolve user references and to evaluate the policy's tests and sshTests blocks. Required when those checks are needed.")
+	checkPolicy.Flags().BoolP(bypassFlag, "", false, "Open the database directly (no running server required) to resolve user references and to evaluate the policy's tests and sshTests blocks. Required when those checks are needed.")
 	mustMarkRequired(checkPolicy, "file")
 	policyCmd.AddCommand(checkPolicy)
 }
@@ -66,11 +77,7 @@ var getPolicy = &cobra.Command{
 		var policyData string
 
 		if bypass, _ := cmd.Flags().GetBool(bypassFlag); bypass {
-			if !confirmAction(cmd, "DO NOT run this command if an instance of headscale is running, are you sure headscale is not running?") {
-				return errAborted
-			}
-
-			d, err := bypassDatabase()
+			d, err := openBypassDB(cmd)
 			if err != nil {
 				return err
 			}
@@ -83,19 +90,23 @@ var getPolicy = &cobra.Command{
 
 			policyData = pol.Data
 		} else {
-			ctx, client, conn, cancel, err := newHeadscaleCLIWithConfig()
-			if err != nil {
-				return fmt.Errorf("connecting to headscale: %w", err)
-			}
-			defer cancel()
-			defer conn.Close()
+			err := withClient(func(ctx context.Context, client *clientv1.ClientWithResponses) error {
+				resp, err := client.GetPolicyWithResponse(ctx)
+				if err != nil {
+					return fmt.Errorf("loading ACL policy: %w", err)
+				}
 
-			response, err := client.GetPolicy(ctx, &v1.GetPolicyRequest{})
-			if err != nil {
-				return fmt.Errorf("loading ACL policy: %w", err)
-			}
+				if resp.StatusCode() != http.StatusOK {
+					return apiError(resp.StatusCode(), resp.ApplicationproblemJSONDefault)
+				}
 
-			policyData = response.GetPolicy()
+				policyData = resp.JSON200.Policy
+
+				return nil
+			})
+			if err != nil {
+				return err
+			}
 		}
 
 		// This does not pass output format as we don't support yaml, json or
@@ -122,17 +133,13 @@ var setPolicy = &cobra.Command{
 		}
 
 		if bypass, _ := cmd.Flags().GetBool(bypassFlag); bypass {
-			if !confirmAction(cmd, "DO NOT run this command if an instance of headscale is running, are you sure headscale is not running?") {
-				return errAborted
-			}
-
-			d, err := bypassDatabase()
+			d, err := openBypassDB(cmd)
 			if err != nil {
 				return err
 			}
 			defer d.Close()
 
-			users, err := d.ListUsers()
+			users, err := d.ListUsers(nil)
 			if err != nil {
 				return fmt.Errorf("loading users for policy validation: %w", err)
 			}
@@ -147,18 +154,24 @@ var setPolicy = &cobra.Command{
 				return fmt.Errorf("setting ACL policy: %w", err)
 			}
 		} else {
-			request := &v1.SetPolicyRequest{Policy: string(policyBytes)}
+			policyStr := string(policyBytes)
 
-			ctx, client, conn, cancel, err := newHeadscaleCLIWithConfig()
-			if err != nil {
-				return fmt.Errorf("connecting to headscale: %w", err)
-			}
-			defer cancel()
-			defer conn.Close()
+			err := withClient(func(ctx context.Context, client *clientv1.ClientWithResponses) error {
+				resp, err := client.SetPolicyWithResponse(ctx, clientv1.SetPolicyJSONRequestBody{
+					Policy: &policyStr,
+				})
+				if err != nil {
+					return fmt.Errorf("setting ACL policy: %w", err)
+				}
 
-			_, err = client.SetPolicy(ctx, request)
+				if resp.StatusCode() != http.StatusOK {
+					return apiError(resp.StatusCode(), resp.ApplicationproblemJSONDefault)
+				}
+
+				return nil
+			})
 			if err != nil {
-				return fmt.Errorf("setting ACL policy: %w", err)
+				return err
 			}
 		}
 
@@ -173,8 +186,8 @@ var checkPolicy = &cobra.Command{
 	Short: "Check the Policy file for errors",
 	Long: `
 	Check validates the policy against the server's live users and nodes,
-	running any "tests" or "sshTests" block. By default the command is a
-	thin frontend for a gRPC call to a running headscale; pass --` + bypassFlag + ` to
+	running any "tests" or "sshTests" block. By default the command calls a
+	running headscale over its API; pass --` + bypassFlag + ` to
 	open the database directly when headscale is not running.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		policyPath, _ := cmd.Flags().GetString("file")
@@ -185,17 +198,13 @@ var checkPolicy = &cobra.Command{
 		}
 
 		if bypass, _ := cmd.Flags().GetBool(bypassFlag); bypass {
-			if !confirmAction(cmd, "DO NOT run this command if an instance of headscale is running, are you sure headscale is not running?") {
-				return errAborted
-			}
-
-			d, err := bypassDatabase()
+			d, err := openBypassDB(cmd)
 			if err != nil {
 				return err
 			}
 			defer d.Close()
 
-			users, err := d.ListUsers()
+			users, err := d.ListUsers(nil)
 			if err != nil {
 				return fmt.Errorf("loading users: %w", err)
 			}
@@ -224,14 +233,22 @@ var checkPolicy = &cobra.Command{
 			return nil
 		}
 
-		ctx, client, conn, cancel, err := newHeadscaleCLIWithConfig()
-		if err != nil {
-			return fmt.Errorf("connecting to headscale: %w", err)
-		}
-		defer cancel()
-		defer conn.Close()
+		policyStr := string(policyBytes)
 
-		_, err = client.CheckPolicy(ctx, &v1.CheckPolicyRequest{Policy: string(policyBytes)})
+		err = withClient(func(ctx context.Context, client *clientv1.ClientWithResponses) error {
+			resp, err := client.CheckPolicyWithResponse(ctx, clientv1.CheckPolicyJSONRequestBody{
+				Policy: &policyStr,
+			})
+			if err != nil {
+				return err
+			}
+
+			if resp.StatusCode() != http.StatusOK {
+				return apiError(resp.StatusCode(), resp.ApplicationproblemJSONDefault)
+			}
+
+			return nil
+		})
 		if err != nil {
 			return err
 		}

@@ -1321,3 +1321,63 @@ func TestRebuildPeerMapsWithChangedPeersFunc(t *testing.T) {
 	assert.Equal(t, 1, peers1.Len(), "ListPeers for node1 should return 1")
 	assert.Equal(t, 1, peers2.Len(), "ListPeers for node2 should return 1")
 }
+
+// TestGetNodesByMachineKeyAllUsers ensures the lookup returns every node sharing
+// a machine key keyed by owning UserID (tagged nodes under UserID(0)), so callers
+// see the full set instead of a single arbitrary pick.
+func TestGetNodesByMachineKeyAllUsers(t *testing.T) {
+	mk := key.NewMachine().Public()
+
+	t.Run("empty when absent", func(t *testing.T) {
+		store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+		store.Start()
+		defer store.Stop()
+
+		require.Empty(t, store.GetNodesByMachineKeyAllUsers(mk))
+	})
+
+	t.Run("returns all user-owned nodes keyed by user", func(t *testing.T) {
+		store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+		store.Start()
+		defer store.Stop()
+
+		n1 := createTestNode(1, 1, "user1", "node1")
+		n1.MachineKey = mk
+		n2 := createTestNode(2, 2, "user2", "node2")
+		n2.MachineKey = mk
+
+		store.PutNode(n1)
+		store.PutNode(n2)
+
+		all := store.GetNodesByMachineKeyAllUsers(mk)
+		require.Len(t, all, 2)
+		require.Equal(t, types.NodeID(1), all[types.UserID(1)].ID())
+		require.Equal(t, types.NodeID(2), all[types.UserID(2)].ID())
+	})
+
+	t.Run("tagged node indexed under UserID(0)", func(t *testing.T) {
+		store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+		store.Start()
+		defer store.Stop()
+
+		owned := createTestNode(1, 1, "user1", "node1")
+		owned.MachineKey = mk
+		tagged := createTestNode(3, 3, "user3", "node3")
+		tagged.MachineKey = mk
+		tagged.UserID = nil
+		tagged.User = nil
+		tagged.Tags = []string{"tag:foo"}
+
+		store.PutNode(owned)
+		store.PutNode(tagged)
+
+		all := store.GetNodesByMachineKeyAllUsers(mk)
+		require.Len(t, all, 2)
+		require.Equal(t, types.NodeID(1), all[types.UserID(1)].ID())
+		require.True(t, all[types.UserID(0)].IsTagged())
+		require.Equal(t, types.NodeID(3), all[types.UserID(0)].ID())
+	})
+}

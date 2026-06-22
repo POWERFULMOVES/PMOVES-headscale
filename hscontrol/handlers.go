@@ -148,20 +148,12 @@ func (h *Headscale) handleVerifyRequest(
 		return NewHTTPError(http.StatusBadRequest, "Bad Request: invalid JSON", fmt.Errorf("parsing DERP client request: %w", err))
 	}
 
-	nodes := h.state.ListNodes()
-
-	// Check if any node has the requested NodeKey
-	var nodeKeyFound bool
-
-	for _, node := range nodes.All() {
-		if node.NodeKey() == derpAdmitClientRequest.NodePublic {
-			nodeKeyFound = true
-			break
-		}
-	}
+	allow := h.state.ListNodes().ContainsFunc(func(n types.NodeView) bool {
+		return n.NodeKey() == derpAdmitClientRequest.NodePublic
+	})
 
 	resp := &tailcfg.DERPAdmitClientResponse{
-		Allow: nodeKeyFound,
+		Allow: allow,
 	}
 
 	return json.NewEncoder(writer).Encode(resp)
@@ -180,13 +172,18 @@ func (h *Headscale) VerifyHandler(
 
 	req.Body = http.MaxBytesReader(writer, req.Body, verifyBodyLimit)
 
+	// Set the Content-Type before any body byte is written. The first
+	// Write in handleVerifyRequest triggers an implicit WriteHeader that
+	// snapshots the header map, so setting it afterwards is a no-op. The
+	// error path resets the Content-Type via http.Error, so error
+	// responses remain text/plain.
+	writer.Header().Set("Content-Type", "application/json")
+
 	err := h.handleVerifyRequest(req, writer)
 	if err != nil {
 		httpError(writer, err)
 		return
 	}
-
-	writer.Header().Set("Content-Type", "application/json")
 }
 
 // KeyHandler provides the Headscale pub key
@@ -300,18 +297,23 @@ func NewAuthProviderWeb(serverURL string) *AuthProviderWeb {
 	}
 }
 
-func (a *AuthProviderWeb) RegisterURL(authID types.AuthID) string {
+// authPathURL builds an auth-flow URL of the form
+// "<serverURL>/<kind>/<id>", trimming a trailing slash from serverURL.
+func authPathURL(serverURL, kind string, authID types.AuthID) string {
 	return fmt.Sprintf(
-		"%s/register/%s",
-		strings.TrimSuffix(a.serverURL, "/"),
-		authID.String())
+		"%s/%s/%s",
+		strings.TrimSuffix(serverURL, "/"),
+		kind,
+		authID.String(),
+	)
+}
+
+func (a *AuthProviderWeb) RegisterURL(authID types.AuthID) string {
+	return authPathURL(a.serverURL, "register", authID)
 }
 
 func (a *AuthProviderWeb) AuthURL(authID types.AuthID) string {
-	return fmt.Sprintf(
-		"%s/auth/%s",
-		strings.TrimSuffix(a.serverURL, "/"),
-		authID.String())
+	return authPathURL(a.serverURL, "auth", authID)
 }
 
 func (a *AuthProviderWeb) AuthHandler(
@@ -338,7 +340,7 @@ func (a *AuthProviderWeb) AuthHandler(
 }
 
 func authIDFromRequest(req *http.Request) (types.AuthID, error) {
-	raw, err := urlParam[string](req, "auth_id")
+	raw, err := stringParam(req, "auth_id")
 	if err != nil {
 		return "", NewHTTPError(http.StatusBadRequest, "invalid auth id", fmt.Errorf("parsing auth_id from URL: %w", err))
 	}
