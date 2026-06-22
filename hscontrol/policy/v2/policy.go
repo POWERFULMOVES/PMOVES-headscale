@@ -822,7 +822,7 @@ func (pm *PolicyManager) SetUsers(users []types.User) (bool, error) {
 
 	// If SSH policies exist, force a policy change when users are updated
 	// This ensures nodes get updated SSH policies even if other policy hashes didn't change
-	if pm.pol != nil && pm.pol.SSHs != nil && len(pm.pol.SSHs) > 0 {
+	if pm.pol != nil && len(pm.pol.SSHs) > 0 {
 		return true, nil
 	}
 
@@ -878,15 +878,23 @@ func (pm *PolicyManager) SetNodes(nodes views.Slice[types.NodeView]) (bool, erro
 	return false, nil
 }
 
+// nodeIDViewMap indexes a slice of node views by node ID. On duplicate IDs the
+// last view wins, matching the open-coded loops it replaces.
+func nodeIDViewMap(s views.Slice[types.NodeView]) map[types.NodeID]types.NodeView {
+	m := make(map[types.NodeID]types.NodeView, s.Len())
+	for _, n := range s.All() {
+		m[n.ID()] = n
+	}
+
+	return m
+}
+
 func (pm *PolicyManager) nodesHavePolicyAffectingChanges(newNodes views.Slice[types.NodeView]) bool {
 	if pm.nodes.Len() != newNodes.Len() {
 		return true
 	}
 
-	oldNodes := make(map[types.NodeID]types.NodeView, pm.nodes.Len())
-	for _, node := range pm.nodes.All() {
-		oldNodes[node.ID()] = node
-	}
+	oldNodes := nodeIDViewMap(pm.nodes)
 
 	for _, newNode := range newNodes.All() {
 		oldNode, exists := oldNodes[newNode.ID()]
@@ -917,12 +925,18 @@ func (pm *PolicyManager) nodesHavePolicyAffectingChanges(newNodes views.Slice[ty
 // set any existing tag on any node by calling [state.State.SetNodeTags] directly,
 // which bypasses this authorization check.
 func (pm *PolicyManager) NodeCanHaveTag(node types.NodeView, tag string) bool {
-	if pm == nil || pm.pol == nil {
+	if pm == nil {
 		return false
 	}
 
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+
+	// pm.pol is written by SetPolicy under pm.mu; reading it before the
+	// lock races with concurrent policy reloads.
+	if pm.pol == nil {
+		return false
+	}
 
 	// Check if tag exists in policy
 	owners, exists := pm.pol.TagOwners[Tag(tag)]
@@ -1000,12 +1014,18 @@ func (pm *PolicyManager) userMatchesOwner(user types.UserView, owner Owner) bool
 
 // TagExists reports whether the given tag is defined in the policy.
 func (pm *PolicyManager) TagExists(tag string) bool {
-	if pm == nil || pm.pol == nil {
+	if pm == nil {
 		return false
 	}
 
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+
+	// pm.pol is written by SetPolicy under pm.mu; reading it before the
+	// lock races with concurrent policy reloads.
+	if pm.pol == nil {
+		return false
+	}
 
 	_, exists := pm.pol.TagOwners[Tag(tag)]
 
@@ -1076,12 +1096,18 @@ func (pm *PolicyManager) NodeCanApproveRoute(node types.NodeView, route netip.Pr
 func (pm *PolicyManager) ViaRoutesForPeer(viewer, peer types.NodeView) types.ViaRouteResult {
 	var result types.ViaRouteResult
 
-	if pm == nil || pm.pol == nil {
+	if pm == nil {
 		return result
 	}
 
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+
+	// pm.pol is written by SetPolicy under pm.mu; reading it before the
+	// lock races with concurrent policy reloads.
+	if pm.pol == nil {
+		return result
+	}
 
 	// Self-steering doesn't apply.
 	if viewer.ID() == peer.ID() {
@@ -1291,6 +1317,11 @@ func (pm *PolicyManager) DebugString() string {
 		return "PolicyManager is not setup"
 	}
 
+	// pm.pol, filter, matchers, and the derived maps are all written
+	// under pm.mu by SetPolicy/SetUsers/SetNodes.
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
 	var sb strings.Builder
 
 	fmt.Fprintf(&sb, "PolicyManager (v%d):\n\n", pm.Version())
@@ -1364,15 +1395,8 @@ func (pm *PolicyManager) DebugString() string {
 // the entire cache.
 func (pm *PolicyManager) invalidateAutogroupSelfCache(oldNodes, newNodes views.Slice[types.NodeView]) {
 	// Build maps for efficient lookup
-	oldNodeMap := make(map[types.NodeID]types.NodeView)
-	for _, node := range oldNodes.All() {
-		oldNodeMap[node.ID()] = node
-	}
-
-	newNodeMap := make(map[types.NodeID]types.NodeView)
-	for _, node := range newNodes.All() {
-		newNodeMap[node.ID()] = node
-	}
+	oldNodeMap := nodeIDViewMap(oldNodes)
+	newNodeMap := nodeIDViewMap(newNodes)
 
 	// Track which users are affected by changes.
 	// Tagged nodes don't participate in autogroup:self (identity is tag-based),
@@ -1431,20 +1455,9 @@ func (pm *PolicyManager) invalidateAutogroupSelfCache(oldNodes, newNodes views.S
 				affectedUsers[newNode.TypedUserID()] = struct{}{}
 			}
 
-			// Check if IPs changed (simple check - could be more sophisticated)
-			oldIPs := oldNode.IPs()
-
-			newIPs := newNode.IPs()
-			if len(oldIPs) != len(newIPs) {
+			// Check if IPs changed.
+			if !slices.Equal(oldNode.IPs(), newNode.IPs()) {
 				affectedUsers[newNode.TypedUserID()] = struct{}{}
-			} else {
-				// Check if any IPs are different
-				for i, oldIP := range oldIPs {
-					if i >= len(newIPs) || oldIP != newIPs[i] {
-						affectedUsers[newNode.TypedUserID()] = struct{}{}
-						break
-					}
-				}
 			}
 		}
 	}
@@ -1453,53 +1466,29 @@ func (pm *PolicyManager) invalidateAutogroupSelfCache(oldNodes, newNodes views.S
 	// For autogroup:self, we need to clear all nodes belonging to affected users
 	// because autogroup:self rules depend on the entire user's device set.
 	for nodeID := range pm.filterRulesMap {
-		// Find the user for this cached node
+		// Find the user for this cached node using the already-built indexes.
+		node, ok := newNodeMap[nodeID]
+		if !ok {
+			node, ok = oldNodeMap[nodeID]
+		}
+
+		// Node not found in either old or new list, clear it.
+		if !ok {
+			delete(pm.filterRulesMap, nodeID)
+			delete(pm.matchersForNodeMap, nodeID)
+
+			continue
+		}
+
+		// Tagged nodes don't participate in autogroup:self, so their cache
+		// doesn't need user-based invalidation; leave nodeUserID at zero.
 		var nodeUserID types.UserID
-
-		found := false
-
-		// Check in new nodes first
-		for _, node := range newNodes.All() {
-			if node.ID() == nodeID {
-				// Tagged nodes don't participate in autogroup:self,
-				// so their cache doesn't need user-based invalidation.
-				if node.IsTagged() {
-					found = true
-					break
-				}
-
-				nodeUserID = node.TypedUserID()
-				found = true
-
-				break
-			}
+		if !node.IsTagged() {
+			nodeUserID = node.TypedUserID()
 		}
 
-		// If not found in new nodes, check old nodes
-		if !found {
-			for _, node := range oldNodes.All() {
-				if node.ID() == nodeID {
-					if node.IsTagged() {
-						found = true
-						break
-					}
-
-					nodeUserID = node.TypedUserID()
-					found = true
-
-					break
-				}
-			}
-		}
-
-		// If we found the user and they're affected, clear this cache entry
-		if found {
-			if _, affected := affectedUsers[nodeUserID]; affected {
-				delete(pm.filterRulesMap, nodeID)
-				delete(pm.matchersForNodeMap, nodeID)
-			}
-		} else {
-			// Node not found in either old or new list, clear it
+		// If the owning user is affected, clear this cache entry.
+		if _, affected := affectedUsers[nodeUserID]; affected {
 			delete(pm.filterRulesMap, nodeID)
 			delete(pm.matchersForNodeMap, nodeID)
 		}
@@ -1530,15 +1519,8 @@ func (pm *PolicyManager) invalidateNodeCache(newNodes views.Slice[types.NodeView
 // invalidateGlobalPolicyCache invalidates only nodes whose properties affecting
 // [policyutil.ReduceFilterRules] changed. For global policies, each node's filter is independent.
 func (pm *PolicyManager) invalidateGlobalPolicyCache(newNodes views.Slice[types.NodeView]) {
-	oldNodeMap := make(map[types.NodeID]types.NodeView)
-	for _, node := range pm.nodes.All() {
-		oldNodeMap[node.ID()] = node
-	}
-
-	newNodeMap := make(map[types.NodeID]types.NodeView)
-	for _, node := range newNodes.All() {
-		newNodeMap[node.ID()] = node
-	}
+	oldNodeMap := nodeIDViewMap(pm.nodes)
+	newNodeMap := nodeIDViewMap(newNodes)
 
 	// Invalidate nodes whose properties changed
 	for nodeID, newNode := range newNodeMap {

@@ -2,6 +2,7 @@ package v2
 
 import (
 	"fmt"
+	"maps"
 	"net/netip"
 	"slices"
 	"strings"
@@ -92,14 +93,7 @@ func (r SSHPolicyTestResults) Errors() string {
 }
 
 func sortedUsers(m map[string][]string) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-
-	slices.Sort(keys)
-
-	return keys
+	return slices.Sorted(maps.Keys(m))
 }
 
 // displayUser shows an empty username as `""` rather than blank.
@@ -134,11 +128,7 @@ func (pm *PolicyManager) RunSSHTests() error {
 	cache := make(map[types.NodeID]*tailcfg.SSHPolicy)
 	results := runSSHPolicyTests(pm.pol, pm.users, pm.nodes, cache)
 
-	if results.AllPassed {
-		return nil
-	}
-
-	return fmt.Errorf("%w:\n%s", errSSHPolicyTestsFailed, results.Errors())
+	return wrapTestResult(errSSHPolicyTestsFailed, results.AllPassed, results.Errors)
 }
 
 // evaluateSSHTests runs the block against pol without mutating live state.
@@ -154,11 +144,7 @@ func evaluateSSHTests(
 	cache := make(map[types.NodeID]*tailcfg.SSHPolicy)
 	results := runSSHPolicyTests(pol, users, nodes, cache)
 
-	if results.AllPassed {
-		return nil
-	}
-
-	return fmt.Errorf("%w:\n%s", errSSHPolicyTestsFailed, results.Errors())
+	return wrapTestResult(errSSHPolicyTestsFailed, results.AllPassed, results.Errors)
 }
 
 // runSSHPolicyTests evaluates every sshTests entry. The cache is keyed
@@ -251,28 +237,21 @@ func runSSHPolicyTest(
 		return res
 	}
 
-	for _, user := range test.Accept {
-		evaluateAssertion(
-			pol, users, nodes, cache,
-			srcAddrs, dstNodes, user.String(),
-			assertAccept, &res,
-		)
-	}
-
-	for _, user := range test.Deny {
-		evaluateAssertion(
-			pol, users, nodes, cache,
-			srcAddrs, dstNodes, user.String(),
-			assertDeny, &res,
-		)
-	}
-
-	for _, user := range test.Check {
-		evaluateAssertion(
-			pol, users, nodes, cache,
-			srcAddrs, dstNodes, user.String(),
-			assertCheck, &res,
-		)
+	for _, g := range []struct {
+		users []SSHUser
+		kind  sshAssertion
+	}{
+		{test.Accept, assertAccept},
+		{test.Deny, assertDeny},
+		{test.Check, assertCheck},
+	} {
+		for _, user := range g.users {
+			evaluateAssertion(
+				pol, users, nodes, cache,
+				srcAddrs, dstNodes, user.String(),
+				g.kind, &res,
+			)
+		}
 	}
 
 	return res
@@ -409,10 +388,7 @@ func resolveSSHTestSource(
 		return nil, 0, nil
 	}
 
-	out := make([]netip.Addr, 0)
-	for a := range addrs.Iter() {
-		out = append(out, a)
-	}
+	out := slices.Collect(addrs.Iter())
 
 	var userID uint
 

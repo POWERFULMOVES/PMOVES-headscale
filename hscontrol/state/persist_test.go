@@ -1,14 +1,18 @@
 package state
 
 import (
+	"errors"
 	"net/netip"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -324,4 +328,257 @@ func TestReauthRejectsNodeKeyClaimedByAnotherMachine(t *testing.T) {
 	})
 	require.Error(t, err,
 		"re-auth claiming a NodeKey bound to another machine must be rejected")
+}
+
+// TestReauthPreservesEndpointsWhenClientOmitsThem proves the re-auth/update
+// path keeps a node's live WireGuard endpoints when the originating
+// RegisterRequest carried none. Web/OIDC relogins report endpoints via
+// MapRequest, not register, so RegData.Endpoints is empty; wiping the stored
+// endpoints would advertise the re-keyed node to peers endpoint-less, which
+// drives head/unstable tailscale clients into one-way disco-deafness.
+func TestReauthPreservesEndpointsWhenClientOmitsThem(t *testing.T) {
+	dbPath := t.TempDir() + "/headscale.db"
+	cfg := persistTestConfig(dbPath)
+
+	database, err := db.NewHeadscaleDatabase(cfg)
+	require.NoError(t, err)
+
+	user := database.CreateUserForTest("user")
+	require.NoError(t, database.Close())
+
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	machine := key.NewMachine()
+	endpoints := []netip.AddrPort{
+		netip.MustParseAddrPort("192.168.1.5:41641"),
+		netip.MustParseAddrPort("10.0.0.5:41641"),
+	}
+
+	// Node is registered and has reported live endpoints (as after its first
+	// MapRequest).
+	node, err := s.createAndSaveNewNode(newNodeParams{
+		User:           *user,
+		MachineKey:     machine.Public(),
+		NodeKey:        key.NewNode().Public(),
+		DiscoKey:       key.NewDisco().Public(),
+		Hostname:       "node",
+		Endpoints:      endpoints,
+		RegisterMethod: util.RegisterMethodCLI,
+	})
+	require.NoError(t, err)
+	require.Equal(t, endpoints, node.Endpoints().AsSlice(),
+		"precondition: node has live endpoints")
+
+	// Node re-authenticates, rotating its NodeKey. The RegisterRequest carries
+	// no endpoints.
+	updated, err := s.applyAuthNodeUpdate(authNodeUpdateParams{
+		ExistingNode: node,
+		RegData: &types.RegistrationData{
+			MachineKey: machine.Public(),
+			NodeKey:    key.NewNode().Public(),
+			Hostname:   "node",
+			Hostinfo:   &tailcfg.Hostinfo{},
+			Endpoints:  nil,
+		},
+		ValidHostinfo:  &tailcfg.Hostinfo{},
+		Hostname:       "node",
+		User:           user,
+		RegisterMethod: util.RegisterMethodCLI,
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, endpoints, updated.Endpoints().AsSlice(),
+		"re-auth without reported endpoints must preserve the node's live endpoints")
+}
+
+// TestReauthChange covers the decision both re-auth paths share: a same-user
+// relogin must be an incremental peer patch (so the tailscale client takes its
+// fast patch path), never a whole-node add (which strands a re-keyed,
+// momentarily-endpoint-less peer disco-deaf); a policy change forces a full
+// recompute; a new node is a whole-node add.
+func TestReauthChange(t *testing.T) {
+	n := types.Node{
+		ID:       7,
+		NodeKey:  key.NewNode().Public(),
+		DiscoKey: key.NewDisco().Public(),
+	}
+	node := n.View()
+
+	relogin := reauthChange(node, true, false)
+	assert.Len(t, relogin.PeerPatches, 1, "relogin must be a peer patch")
+	assert.Empty(t, relogin.PeersChanged, "relogin must not be a whole-node add")
+
+	added := reauthChange(node, false, false)
+	assert.Empty(t, added.PeerPatches)
+	assert.Len(t, added.PeersChanged, 1, "a new node must be a whole-node add")
+
+	pol := reauthChange(node, true, true)
+	assert.Empty(t, pol.PeerPatches, "a policy change must not be a peer patch")
+	assert.Empty(t, pol.PeersChanged)
+	assert.False(t, pol.IsEmpty(), "a policy change must be non-empty")
+}
+
+// TestPreAuthKeyReauthRejectsNodeKeyClaimedByAnotherMachine is the pre-auth-key
+// analogue of TestReauthRejectsNodeKeyClaimedByAnotherMachine: re-registering
+// via a pre-auth key must enforce the same 1:1 NodeKey<->MachineKey binding the
+// auth path and poll-time validation enforce, so a node cannot rotate its key
+// to a victim's and poison the NodeStore NodeKey index.
+func TestPreAuthKeyReauthRejectsNodeKeyClaimedByAnotherMachine(t *testing.T) {
+	dbPath := t.TempDir() + "/headscale.db"
+	cfg := persistTestConfig(dbPath)
+
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	attacker := s.CreateUserForTest("attacker")
+	victim := s.CreateUserForTest("victim")
+
+	victimMachine := key.NewMachine()
+	victimNodeKey := key.NewNode()
+	_, err = s.createAndSaveNewNode(newNodeParams{
+		User:           *victim,
+		MachineKey:     victimMachine.Public(),
+		NodeKey:        victimNodeKey.Public(),
+		DiscoKey:       key.NewDisco().Public(),
+		Hostname:       "victim",
+		RegisterMethod: util.RegisterMethodCLI,
+	})
+	require.NoError(t, err)
+
+	// Attacker registers its own node with a reusable pre-auth key.
+	pak, err := s.CreatePreAuthKey(attacker.TypedID(), true, false, nil, nil)
+	require.NoError(t, err)
+
+	attackerMachine := key.NewMachine()
+	regReq := tailcfg.RegisterRequest{
+		Auth:     &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
+		NodeKey:  key.NewNode().Public(),
+		Hostinfo: &tailcfg.Hostinfo{Hostname: "attacker"},
+		Expiry:   time.Now().Add(24 * time.Hour),
+	}
+	_, _, err = s.HandleNodeFromPreAuthKey(regReq, attackerMachine.Public())
+	require.NoError(t, err)
+
+	// Attacker re-registers its own node but supplies the victim's NodeKey.
+	attack := regReq
+	attack.NodeKey = victimNodeKey.Public()
+	_, _, err = s.HandleNodeFromPreAuthKey(attack, attackerMachine.Public())
+	require.ErrorIs(t, err, ErrNodeKeyInUse,
+		"pre-auth-key re-registration claiming another machine's NodeKey must be rejected")
+
+	// The victim still owns its NodeKey.
+	owner, ok := s.GetNodeByNodeKey(victimNodeKey.Public())
+	require.True(t, ok)
+	require.Equal(t, victimMachine.Public(), owner.MachineKey(),
+		"victim's NodeKey index entry must be untouched")
+}
+
+var errInjectedNodeUpdate = errors.New("injected node update failure")
+
+// TestPreAuthKeyReauthRevertsNodeStoreOnDBFailure ensures a failed database
+// write during pre-auth-key re-registration does not leave the NodeStore
+// holding a node key that was never persisted: a restart would reload the old
+// row and the client's current key would no longer resolve, locking it out.
+func TestPreAuthKeyReauthRevertsNodeStoreOnDBFailure(t *testing.T) {
+	dbPath := t.TempDir() + "/headscale.db"
+	cfg := persistTestConfig(dbPath)
+
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	user := s.CreateUserForTest("reauth-user")
+
+	pak, err := s.CreatePreAuthKey(user.TypedID(), true, false, nil, nil)
+	require.NoError(t, err)
+
+	machineKey := key.NewMachine()
+	regReq := tailcfg.RegisterRequest{
+		Auth:     &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
+		NodeKey:  key.NewNode().Public(),
+		Hostinfo: &tailcfg.Hostinfo{Hostname: "reauth-node"},
+		Expiry:   time.Now().Add(24 * time.Hour),
+	}
+	node, _, err := s.HandleNodeFromPreAuthKey(regReq, machineKey.Public())
+	require.NoError(t, err)
+
+	origNodeKey := node.NodeKey()
+
+	// Fail the node row update so the re-registration's database write errors
+	// after the NodeStore has already been mutated.
+	require.NoError(t, s.db.DB.Callback().Update().Before("gorm:update").
+		Register("fail_node_update", func(tx *gorm.DB) {
+			if tx.Statement.Table == "nodes" {
+				_ = tx.AddError(errInjectedNodeUpdate)
+			}
+		}))
+
+	reReg := regReq
+	reReg.NodeKey = key.NewNode().Public() // rotate -> NodeStore mutation, then DB write fails
+	_, _, err = s.HandleNodeFromPreAuthKey(reReg, machineKey.Public())
+	require.NoError(t, s.db.DB.Callback().Update().Remove("fail_node_update"))
+	require.Error(t, err, "re-registration must fail when the database write fails")
+
+	got, ok := s.nodeStore.GetNode(node.ID())
+	require.True(t, ok)
+	require.Equal(t, origNodeKey, got.NodeKey(),
+		"NodeStore must revert to the persisted node key when the write fails")
+}
+
+// TestConcurrentPreAuthKeyRegistrationSameMachineKey ensures concurrent
+// registrations of the same machine key resolve to a single node. Without
+// serialising the find-then-create section, each request sees "no existing
+// node" and creates its own, leaving duplicate nodes and IP allocations for
+// one machine.
+func TestConcurrentPreAuthKeyRegistrationSameMachineKey(t *testing.T) {
+	dbPath := t.TempDir() + "/headscale.db"
+	cfg := persistTestConfig(dbPath)
+
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	user := s.CreateUserForTest("concurrent-user")
+
+	pak, err := s.CreatePreAuthKey(user.TypedID(), true, false, nil, nil)
+	require.NoError(t, err)
+
+	machineKey := key.NewMachine()
+
+	const n = 12
+
+	var wg sync.WaitGroup
+
+	start := make(chan struct{})
+	errs := make(chan error, n)
+
+	for range n {
+		wg.Go(func() {
+			regReq := tailcfg.RegisterRequest{
+				Auth:     &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
+				NodeKey:  key.NewNode().Public(),
+				Hostinfo: &tailcfg.Hostinfo{Hostname: "concurrent-node"},
+				Expiry:   time.Now().Add(24 * time.Hour),
+			}
+
+			<-start
+
+			_, _, err := s.HandleNodeFromPreAuthKey(regReq, machineKey.Public())
+			errs <- err
+		})
+	}
+
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	require.Equal(t, 1, s.ListNodes().Len(),
+		"concurrent registrations of one machine key must yield a single node")
 }

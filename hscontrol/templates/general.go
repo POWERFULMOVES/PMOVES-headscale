@@ -11,17 +11,18 @@ import (
 // that matches the official Headscale documentation design.
 // Uses CSS classes with styles defined in [assets.CSS].
 func mdTypesetBody(children ...elem.Node) *elem.Element {
-	return elem.Body(attrs.Props{
-		attrs.Style: styles.Props{
-			styles.MinHeight:       "100vh",
-			styles.Display:         "flex",
-			styles.FlexDirection:   "column",
-			styles.AlignItems:      "center",
-			styles.BackgroundColor: "var(--hs-bg)",
-			styles.Padding:         "3rem 1.5rem",
-		}.ToInline(),
-		"translate": "no",
-	},
+	return elem.Body(
+		attrs.Props{
+			attrs.Style: styles.Props{
+				styles.MinHeight:       "100vh",
+				styles.Display:         "flex",
+				styles.FlexDirection:   "column",
+				styles.AlignItems:      "center",
+				styles.BackgroundColor: "var(--hs-bg)",
+				styles.Padding:         "3rem 1.5rem",
+			}.ToInline(),
+			"translate": "no",
+		},
 		elem.Main(attrs.Props{
 			attrs.Class: "md-typeset",
 			attrs.Style: styles.Props{
@@ -76,43 +77,10 @@ func Code(children ...elem.Node) *elem.Element {
 	return elem.Code(nil, children...)
 }
 
-// Pre creates a preformatted text block styled by .md-typeset pre
-func Pre(children ...elem.Node) *elem.Element {
-	return elem.Pre(nil, children...)
-}
-
-// PreCode creates a code block inside Pre styled by .md-typeset pre > code
-func PreCode(code string) *elem.Element {
-	return elem.Code(nil, elem.Text(code))
-}
-
-// Deprecated: use [H1], [H2], [H3] instead
-func headerOne(text string) *elem.Element {
-	return H1(elem.Text(text))
-}
-
-// Deprecated: use [H1], [H2], [H3] instead
-func headerTwo(text string) *elem.Element {
-	return H2(elem.Text(text))
-}
-
-// Deprecated: use [H1], [H2], [H3] instead
-func headerThree(text string) *elem.Element {
-	return H3(elem.Text(text))
-}
-
-// contentContainer wraps page content with proper width.
-// Content inside is left-aligned by default.
-func contentContainer(children ...elem.Node) *elem.Element {
-	containerStyle := styles.Props{
-		styles.MaxWidth:      "720px",
-		styles.Width:         "100%",
-		styles.Display:       "flex",
-		styles.FlexDirection: "column",
-		styles.AlignItems:    "flex-start", // Left-align all children
-	}
-
-	return elem.Div(attrs.Props{attrs.Style: containerStyle.ToInline()}, children...)
+// codeBlockText creates a preformatted code block styled by
+// .md-typeset pre > code.
+func codeBlockText(code string) *elem.Element {
+	return elem.Pre(nil, elem.Code(nil, elem.Text(code)))
 }
 
 // headscaleLogo returns the Headscale SVG logo for consistent branding across all pages.
@@ -124,15 +92,16 @@ func headscaleLogo() elem.Node {
 
 // pageFooter creates a consistent footer for all pages.
 func pageFooter() *elem.Element {
-	return elem.Footer(attrs.Props{
-		attrs.Style: styles.Props{
-			styles.MarginTop:  space3XL,
-			styles.TextAlign:  "center",
-			styles.FontSize:   fontSizeSmall,
-			styles.Color:      "var(--md-default-fg-color--light)",
-			styles.LineHeight: lineHeightBase,
-		}.ToInline(),
-	},
+	return elem.Footer(
+		attrs.Props{
+			attrs.Style: styles.Props{
+				styles.MarginTop:  space3XL,
+				styles.TextAlign:  "center",
+				styles.FontSize:   fontSizeSmall,
+				styles.Color:      "var(--md-default-fg-color--light)",
+				styles.LineHeight: lineHeightBase,
+			}.ToInline(),
+		},
 		elem.Text("Powered by "),
 		elem.A(attrs.Props{
 			attrs.Href:   "https://github.com/juanfont/headscale",
@@ -142,13 +111,19 @@ func pageFooter() *elem.Element {
 	)
 }
 
-// listStyle provides consistent styling for ordered and unordered lists
-// EXTRACTED FROM: .md-typeset ol, .md-typeset ul CSS rules
-var listStyle = styles.Props{
-	styles.LineHeight:   lineHeightBase,               // 1.6 - From .md-typeset
-	styles.MarginTop:    "1em",                        // From CSS: margin-top: 1em
-	styles.MarginBottom: "1em",                        // From CSS: margin-bottom: 1em
-	styles.PaddingLeft:  "clamp(1.5rem, 5vw, 2.5rem)", // Responsive indentation
+// page renders a standard Headscale page: the given title in the document
+// head, and a body that begins with the Headscale logo, contains the supplied
+// content nodes in order, and ends with the shared footer.
+func page(title string, content ...elem.Node) *elem.Element {
+	body := make([]elem.Node, 0, len(content)+2)
+	body = append(body, headscaleLogo())
+	body = append(body, content...)
+	body = append(body, pageFooter())
+
+	return HtmlStructure(
+		elem.Title(nil, elem.Text(title)),
+		mdTypesetBody(body...),
+	)
 }
 
 // HtmlStructure creates a complete HTML document structure with proper meta tags
@@ -157,8 +132,10 @@ var listStyle = styles.Props{
 // Styling is provided via a CSS stylesheet (Material for MkDocs design system) with
 // minimal inline styles for layout and positioning.
 func HtmlStructure(head, body *elem.Element) *elem.Element {
-	return elem.Html(attrs.Props{attrs.Lang: "en"},
-		elem.Head(nil,
+	return elem.Html(
+		attrs.Props{attrs.Lang: "en"},
+		elem.Head(
+			nil,
 			elem.Meta(attrs.Props{
 				attrs.Charset: "UTF-8",
 			}),
@@ -195,8 +172,10 @@ func HtmlStructure(head, body *elem.Element) *elem.Element {
 // BlankPage creates a minimal blank HTML page with favicon.
 // Used for endpoints that need to return a valid HTML page with no content.
 func BlankPage() *elem.Element {
-	return elem.Html(attrs.Props{attrs.Lang: "en"},
-		elem.Head(nil,
+	return elem.Html(
+		attrs.Props{attrs.Lang: "en"},
+		elem.Head(
+			nil,
 			elem.Meta(attrs.Props{
 				attrs.Charset: "UTF-8",
 			}),

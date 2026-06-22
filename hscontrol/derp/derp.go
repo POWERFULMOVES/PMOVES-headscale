@@ -22,18 +22,12 @@ import (
 )
 
 func loadDERPMapFromPath(path string) (*tailcfg.DERPMap, error) {
-	derpFile, err := os.Open(path)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	defer derpFile.Close()
 
 	var derpMap tailcfg.DERPMap
-
-	b, err := io.ReadAll(derpFile)
-	if err != nil {
-		return nil, err
-	}
 
 	err = yaml.Unmarshal(b, &derpMap)
 
@@ -85,16 +79,12 @@ func mergeDERPMaps(derpMaps []*tailcfg.DERPMap) *tailcfg.DERPMap {
 
 	for _, derpMap := range derpMaps {
 		// Clone each region: copying the pointer would let a later in-place
-		// shuffle (shuffleRegionNoClone) alias regions shared with the source
-		// map or a previously served map, racing concurrent readers.
+		// shuffle alias regions shared with the source map or a previously
+		// served map, racing concurrent readers.
 		for id, region := range derpMap.Regions {
-			result.Regions[id] = region.Clone()
-		}
-	}
-
-	for id, region := range result.Regions {
-		if region == nil {
-			delete(result.Regions, id)
+			if cloned := region.Clone(); cloned != nil {
+				result.Regions[id] = cloned
+			}
 		}
 	}
 
@@ -152,14 +142,13 @@ func shuffleDERPMap(dm *tailcfg.DERPMap) {
 			continue
 		}
 
-		dm.Regions[id] = shuffleRegionNoClone(region)
+		derpRandom().Shuffle(len(region.Nodes), reflect.Swapper(region.Nodes))
 	}
 }
 
 var crc64Table = crc64.MakeTable(crc64.ISO)
 
 var (
-	derpRandomOnce sync.Once
 	derpRandomInst *rand.Rand
 	derpRandomMu   sync.Mutex
 )
@@ -168,12 +157,10 @@ func derpRandom() *rand.Rand {
 	derpRandomMu.Lock()
 	defer derpRandomMu.Unlock()
 
-	derpRandomOnce.Do(func() {
+	if derpRandomInst == nil {
 		seed := cmp.Or(viper.GetString("dns.base_domain"), time.Now().String())
-		rnd := rand.New(rand.NewSource(0))                        //nolint:gosec // weak random is fine for DERP scrambling
-		rnd.Seed(int64(crc64.Checksum([]byte(seed), crc64Table))) //nolint:gosec // safe conversion
-		derpRandomInst = rnd
-	})
+		derpRandomInst = rand.New(rand.NewSource(int64(crc64.Checksum([]byte(seed), crc64Table)))) //nolint:gosec // weak random is fine for DERP scrambling
+	}
 
 	return derpRandomInst
 }
@@ -182,11 +169,5 @@ func resetDerpRandomForTesting() {
 	derpRandomMu.Lock()
 	defer derpRandomMu.Unlock()
 
-	derpRandomOnce = sync.Once{}
 	derpRandomInst = nil
-}
-
-func shuffleRegionNoClone(r *tailcfg.DERPRegion) *tailcfg.DERPRegion {
-	derpRandom().Shuffle(len(r.Nodes), reflect.Swapper(r.Nodes))
-	return r
 }

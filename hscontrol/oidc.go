@@ -20,6 +20,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/oauth2"
+	"tailscale.com/util/rands"
 )
 
 const (
@@ -54,6 +55,7 @@ var (
 		"authenticated principal does not match any allowed user",
 	)
 	errOIDCUnverifiedEmail = errors.New("authenticated principal has an unverified email")
+	errInvalidPKCEMethod   = errors.New("invalid pkce.method")
 )
 
 // AuthInfo contains both auth ID and verifier information for OIDC validation.
@@ -116,10 +118,7 @@ func NewAuthProviderOIDC(
 }
 
 func (a *AuthProviderOIDC) AuthURL(authID types.AuthID) string {
-	return fmt.Sprintf(
-		"%s/auth/%s",
-		strings.TrimSuffix(a.serverURL, "/"),
-		authID.String())
+	return authPathURL(a.serverURL, "auth", authID)
 }
 
 func (a *AuthProviderOIDC) AuthHandler(
@@ -130,10 +129,7 @@ func (a *AuthProviderOIDC) AuthHandler(
 }
 
 func (a *AuthProviderOIDC) RegisterURL(authID types.AuthID) string {
-	return fmt.Sprintf(
-		"%s/register/%s",
-		strings.TrimSuffix(a.serverURL, "/"),
-		authID.String())
+	return authPathURL(a.serverURL, "register", authID)
 }
 
 // RegisterHandler registers the OIDC callback handler with the given router.
@@ -160,18 +156,10 @@ func (a *AuthProviderOIDC) authHandler(
 	}
 
 	// Set the state and nonce cookies to protect against CSRF attacks
-	state, err := setCSRFCookie(writer, req, "state")
-	if err != nil {
-		httpUserError(writer, err)
-		return
-	}
+	state := setCSRFCookie(writer, req, "state")
 
 	// Set the state and nonce cookies to protect against CSRF attacks
-	nonce, err := setCSRFCookie(writer, req, "nonce")
-	if err != nil {
-		httpUserError(writer, err)
-		return
-	}
+	nonce := setCSRFCookie(writer, req, "nonce")
 
 	registrationInfo := AuthInfo{
 		AuthID:       authID,
@@ -192,6 +180,12 @@ func (a *AuthProviderOIDC) authHandler(
 		case types.PKCEMethodPlain:
 			// oauth2 does not have a plain challenge option, so we add it manually
 			extras = append(extras, oauth2.SetAuthURLParam("code_challenge_method", "plain"), oauth2.SetAuthURLParam("code_challenge", verifier))
+		default:
+			// An unknown method must not silently emit no challenge: a
+			// verifier was generated and is sent at token exchange, so a
+			// missing challenge degrades to no-PKCE without anyone noticing.
+			httpError(writer, NewHTTPError(http.StatusInternalServerError, "internal server error", fmt.Errorf("%w: %q", errInvalidPKCEMethod, a.cfg.PKCE.Method)))
+			return
 		}
 	}
 
@@ -302,8 +296,6 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 		if userinfo2.Groups != nil {
 			claims.Groups = userinfo2.Groups
 		}
-	} else {
-		util.LogErr(err, "could not get userinfo; only using claims from id token")
 	}
 
 	// The user claims are now updated from the userinfo endpoint so we can verify the user
@@ -479,7 +471,7 @@ func (a *AuthProviderOIDC) getOauth2Token(
 		return nil, NewHTTPError(http.StatusForbidden, "invalid code", fmt.Errorf("exchanging code for token: %w", err))
 	}
 
-	return oauth2Token, err
+	return oauth2Token, nil
 }
 
 // extractIDToken extracts the ID token from the oauth2 token.
@@ -657,6 +649,28 @@ func (a *AuthProviderOIDC) createOrUpdateUserFromClaim(
 // browser do not collide.
 const registerConfirmCSRFCookie = "headscale_register_confirm"
 
+// setRegisterConfirmCookie writes the per-session register-confirm CSRF
+// cookie. Pass the CSRF token and authCacheExpiration seconds to set it;
+// pass ("", -1) to clear it after the registration is finalised.
+func setRegisterConfirmCookie(
+	writer http.ResponseWriter,
+	req *http.Request,
+	authID types.AuthID,
+	value string,
+	maxAge int,
+) {
+	//nolint:gosec // G124: Secure set conditionally via req.TLS; HttpOnly + SameSite already set
+	http.SetCookie(writer, &http.Cookie{
+		Name:     registerConfirmCSRFCookie,
+		Value:    value,
+		Path:     "/register/confirm/" + authID.String(),
+		MaxAge:   maxAge,
+		Secure:   req.TLS != nil,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
 // renderRegistrationConfirmInterstitial captures the resolved OIDC
 // identity and node expiry into the cached [types.AuthRequest], sets the CSRF
 // cookie, and renders the confirmation page that the user must
@@ -685,12 +699,7 @@ func (a *AuthProviderOIDC) renderRegistrationConfirmInterstitial(
 		return
 	}
 
-	csrf, err := util.GenerateRandomStringURLSafe(32)
-	if err != nil {
-		httpUserError(writer, fmt.Errorf("generating csrf token: %w", err))
-
-		return
-	}
+	csrf := rands.HexString(32)
 
 	authReq.SetPendingConfirmation(&types.PendingRegistrationConfirmation{
 		UserID:     user.ID,
@@ -698,16 +707,7 @@ func (a *AuthProviderOIDC) renderRegistrationConfirmInterstitial(
 		CSRF:       csrf,
 	})
 
-	//nolint:gosec // G124: Secure set conditionally via req.TLS; HttpOnly + SameSite already set
-	http.SetCookie(writer, &http.Cookie{
-		Name:     registerConfirmCSRFCookie,
-		Value:    csrf,
-		Path:     "/register/confirm/" + authID.String(),
-		MaxAge:   int(authCacheExpiration.Seconds()),
-		Secure:   req.TLS != nil,
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-	})
+	setRegisterConfirmCookie(writer, req, authID, csrf, int(authCacheExpiration.Seconds()))
 
 	regData := authReq.RegistrationData()
 
@@ -824,16 +824,7 @@ func (a *AuthProviderOIDC) RegisterConfirmHandler(
 	}
 
 	// Clear the CSRF cookie now that the registration is final.
-	//nolint:gosec // G124: Secure set conditionally via req.TLS; HttpOnly + SameSite already set
-	http.SetCookie(writer, &http.Cookie{
-		Name:     registerConfirmCSRFCookie,
-		Value:    "",
-		Path:     "/register/confirm/" + authID.String(),
-		MaxAge:   -1,
-		Secure:   req.TLS != nil,
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-	})
+	setRegisterConfirmCookie(writer, req, authID, "", -1)
 
 	content := renderRegistrationSuccessTemplate(user, newNode)
 
@@ -929,11 +920,8 @@ func getCookieName(baseName, value string) string {
 	return fmt.Sprintf("%s_%s", baseName, value[:n])
 }
 
-func setCSRFCookie(w http.ResponseWriter, r *http.Request, name string) (string, error) {
-	val, err := util.GenerateRandomStringURLSafe(64)
-	if err != nil {
-		return val, err
-	}
+func setCSRFCookie(w http.ResponseWriter, r *http.Request, name string) string {
+	val := rands.HexString(64)
 
 	//nolint:gosec // G124: Secure set conditionally via r.TLS; HttpOnly + SameSite set below
 	c := &http.Cookie{
@@ -952,5 +940,5 @@ func setCSRFCookie(w http.ResponseWriter, r *http.Request, name string) (string,
 	}
 	http.SetCookie(w, c)
 
-	return val, nil
+	return val
 }

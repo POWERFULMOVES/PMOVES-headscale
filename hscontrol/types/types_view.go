@@ -112,7 +112,9 @@ func (v UserView) ProviderIdentifier() sql.NullString { return v.ж.ProviderIden
 
 // Provider is the origin of the user account,
 // same as RegistrationMethod, without authkey.
-func (v UserView) Provider() string      { return v.ж.Provider }
+func (v UserView) Provider() string { return v.ж.Provider }
+
+// TODO(kradalby): See if we can fill in Gravatar here.
 func (v UserView) ProfilePicURL() string { return v.ж.ProfilePicURL }
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
@@ -262,10 +264,21 @@ func (v NodeView) IsOnline() views.ValuePointer[bool] { return views.ValuePointe
 // online. Written by the HA prober. Runtime-only.
 func (v NodeView) Unhealthy() bool { return v.ж.Unhealthy }
 
-// SessionEpoch identifies a poll session. Connect bumps it; a
-// Disconnect carrying a stale value is dropped, so a deferred
-// disconnect from a previous session cannot overwrite a newer
-// Connect. Runtime-only.
+// ActiveSessions counts live poll sessions for this node.
+// [State.Connect] increments it and every session release
+// ([State.Disconnect]) decrements it, so the node goes offline
+// exactly when its last session ends — regardless of the order in
+// which overlapping sessions' cleanups run. Never persisted, like
+// SessionEpoch.
+func (v NodeView) ActiveSessions() int { return v.ж.ActiveSessions }
+
+// SessionEpoch identifies a poll session generation; Connect bumps
+// it. It complements ActiveSessions rather than duplicating it:
+// the epoch is monotonic, which the HA prober needs to detect that
+// a probe target reconnected mid-cycle — a refcount can return to
+// its old value, a generation cannot. poll.go also uses the epoch
+// returned by Connect as a "Connect ran" sentinel for its cleanup,
+// and Disconnect logs it. Runtime-only.
 func (v NodeView) SessionEpoch() uint64 { return v.ж.SessionEpoch }
 func (v NodeView) String() string       { return v.ж.String() }
 
@@ -295,6 +308,7 @@ var _NodeViewNeedsRegeneration = Node(struct {
 	DeletedAt      *time.Time
 	IsOnline       *bool
 	Unhealthy      bool
+	ActiveSessions int
 	SessionEpoch   uint64
 }{})
 
@@ -381,10 +395,14 @@ func (v PreAuthKeyView) Hash() views.ByteSlice[[]byte] { return views.ByteSliceO
 // Can be nil for system-created tagged keys
 func (v PreAuthKeyView) UserID() views.ValuePointer[uint] { return views.ValuePointerOf(v.ж.UserID) }
 
-func (v PreAuthKeyView) User() UserView  { return v.ж.User.View() }
-func (v PreAuthKeyView) Reusable() bool  { return v.ж.Reusable }
-func (v PreAuthKeyView) Ephemeral() bool { return v.ж.Ephemeral }
-func (v PreAuthKeyView) Used() bool      { return v.ж.Used }
+func (v PreAuthKeyView) User() UserView { return v.ж.User.View() }
+
+// Free-text description, set via the v2 API. Empty for keys created through
+// the v1 API or CLI.
+func (v PreAuthKeyView) Description() string { return v.ж.Description }
+func (v PreAuthKeyView) Reusable() bool      { return v.ж.Reusable }
+func (v PreAuthKeyView) Ephemeral() bool     { return v.ж.Ephemeral }
+func (v PreAuthKeyView) Used() bool          { return v.ж.Used }
 
 // Tags to assign to nodes registered with this key.
 // Tags are copied to the node during registration.
@@ -398,18 +416,27 @@ func (v PreAuthKeyView) Expiration() views.ValuePointer[time.Time] {
 	return views.ValuePointerOf(v.ж.Expiration)
 }
 
+// Revoked is set when the key is revoked through the v2 API (Tailscale's
+// DELETE). A revoked key is invalid but kept retrievable until the
+// background collector reaps it after the configured retention window.
+func (v PreAuthKeyView) Revoked() views.ValuePointer[time.Time] {
+	return views.ValuePointerOf(v.ж.Revoked)
+}
+
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _PreAuthKeyViewNeedsRegeneration = PreAuthKey(struct {
-	ID         uint64
-	Key        string
-	Prefix     string
-	Hash       []byte
-	UserID     *uint
-	User       *User
-	Reusable   bool
-	Ephemeral  bool
-	Used       bool
-	Tags       []string
-	CreatedAt  *time.Time
-	Expiration *time.Time
+	ID          uint64
+	Key         string
+	Prefix      string
+	Hash        []byte
+	UserID      *uint
+	User        *User
+	Description string
+	Reusable    bool
+	Ephemeral   bool
+	Used        bool
+	Tags        []string
+	CreatedAt   *time.Time
+	Expiration  *time.Time
+	Revoked     *time.Time
 }{})

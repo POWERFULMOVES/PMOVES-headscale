@@ -5,6 +5,7 @@ package sqliteconfig
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -90,20 +91,15 @@ const (
 	JournalModeOff JournalMode = "OFF"
 )
 
-// IsValid returns true if the JournalMode is valid.
-func (j JournalMode) IsValid() bool {
-	switch j {
-	case JournalModeWAL, JournalModeDelete, JournalModeTruncate,
-		JournalModePersist, JournalModeMemory, JournalModeOff:
-		return true
-	default:
-		return false
-	}
+// validJournalModes lists the accepted JournalMode values.
+var validJournalModes = []JournalMode{
+	JournalModeWAL, JournalModeDelete, JournalModeTruncate,
+	JournalModePersist, JournalModeMemory, JournalModeOff,
 }
 
-// String returns the string representation.
-func (j JournalMode) String() string {
-	return string(j)
+// IsValid returns true if the JournalMode is valid.
+func (j JournalMode) IsValid() bool {
+	return slices.Contains(validJournalModes, j)
 }
 
 // AutoVacuum represents SQLite auto_vacuum pragma values.
@@ -147,19 +143,14 @@ const (
 	AutoVacuumIncremental AutoVacuum = "INCREMENTAL"
 )
 
-// IsValid returns true if the AutoVacuum is valid.
-func (a AutoVacuum) IsValid() bool {
-	switch a {
-	case AutoVacuumNone, AutoVacuumFull, AutoVacuumIncremental:
-		return true
-	default:
-		return false
-	}
+// validAutoVacuums lists the accepted AutoVacuum values.
+var validAutoVacuums = []AutoVacuum{
+	AutoVacuumNone, AutoVacuumFull, AutoVacuumIncremental,
 }
 
-// String returns the string representation.
-func (a AutoVacuum) String() string {
-	return string(a)
+// IsValid returns true if the AutoVacuum is valid.
+func (a AutoVacuum) IsValid() bool {
+	return slices.Contains(validAutoVacuums, a)
 }
 
 // Synchronous represents SQLite synchronous pragma values.
@@ -211,19 +202,14 @@ const (
 	SynchronousExtra Synchronous = "EXTRA"
 )
 
-// IsValid returns true if the Synchronous is valid.
-func (s Synchronous) IsValid() bool {
-	switch s {
-	case SynchronousOff, SynchronousNormal, SynchronousFull, SynchronousExtra:
-		return true
-	default:
-		return false
-	}
+// validSynchronous lists the accepted Synchronous values.
+var validSynchronous = []Synchronous{
+	SynchronousOff, SynchronousNormal, SynchronousFull, SynchronousExtra,
 }
 
-// String returns the string representation.
-func (s Synchronous) String() string {
-	return string(s)
+// IsValid returns true if the Synchronous is valid.
+func (s Synchronous) IsValid() bool {
+	return slices.Contains(validSynchronous, s)
 }
 
 // TxLock represents SQLite transaction lock mode.
@@ -267,19 +253,15 @@ const (
 	TxLockExclusive TxLock = "exclusive"
 )
 
-// IsValid returns true if the TxLock is valid.
-func (t TxLock) IsValid() bool {
-	switch t {
-	case TxLockDeferred, TxLockImmediate, TxLockExclusive, "":
-		return true
-	default:
-		return false
-	}
+// validTxLocks lists the accepted TxLock values; the empty string is valid
+// and selects the driver default.
+var validTxLocks = []TxLock{
+	TxLockDeferred, TxLockImmediate, TxLockExclusive, "",
 }
 
-// String returns the string representation.
-func (t TxLock) String() string {
-	return string(t)
+// IsValid returns true if the TxLock is valid.
+func (t TxLock) IsValid() bool {
+	return slices.Contains(validTxLocks, t)
 }
 
 // Config holds SQLite database configuration with type-safe enums.
@@ -367,33 +349,6 @@ func (c *Config) ToURL() (string, error) {
 		return "", fmt.Errorf("invalid config: %w", err)
 	}
 
-	var pragmas []string
-
-	// Add pragma parameters only if they're set (non-zero/non-empty)
-	if c.BusyTimeout > 0 {
-		pragmas = append(pragmas, fmt.Sprintf("busy_timeout=%d", c.BusyTimeout))
-	}
-
-	if c.JournalMode != "" {
-		pragmas = append(pragmas, fmt.Sprintf("journal_mode=%s", c.JournalMode))
-	}
-
-	if c.AutoVacuum != "" {
-		pragmas = append(pragmas, fmt.Sprintf("auto_vacuum=%s", c.AutoVacuum))
-	}
-
-	if c.WALAutocheckpoint >= 0 {
-		pragmas = append(pragmas, fmt.Sprintf("wal_autocheckpoint=%d", c.WALAutocheckpoint))
-	}
-
-	if c.Synchronous != "" {
-		pragmas = append(pragmas, fmt.Sprintf("synchronous=%s", c.Synchronous))
-	}
-
-	if c.ForeignKeys {
-		pragmas = append(pragmas, "foreign_keys=ON")
-	}
-
 	// Handle different database types
 	var baseURL string
 	if c.Path == ":memory:" {
@@ -403,16 +358,36 @@ func (c *Config) ToURL() (string, error) {
 	}
 
 	// Build query parameters
-	queryParts := make([]string, 0, 1+len(pragmas))
+	var queryParts []string
 
 	// Add _txlock first (it's a connection parameter, not a pragma)
 	if c.TxLock != "" {
 		queryParts = append(queryParts, "_txlock="+string(c.TxLock))
 	}
 
-	// Add pragma parameters
-	for _, pragma := range pragmas {
-		queryParts = append(queryParts, "_pragma="+pragma)
+	// Add pragma parameters only if they're set (non-zero/non-empty)
+	if c.BusyTimeout > 0 {
+		queryParts = append(queryParts, fmt.Sprintf("_pragma=busy_timeout=%d", c.BusyTimeout))
+	}
+
+	if c.JournalMode != "" {
+		queryParts = append(queryParts, fmt.Sprintf("_pragma=journal_mode=%s", c.JournalMode))
+	}
+
+	if c.AutoVacuum != "" {
+		queryParts = append(queryParts, fmt.Sprintf("_pragma=auto_vacuum=%s", c.AutoVacuum))
+	}
+
+	if c.WALAutocheckpoint >= 0 {
+		queryParts = append(queryParts, fmt.Sprintf("_pragma=wal_autocheckpoint=%d", c.WALAutocheckpoint))
+	}
+
+	if c.Synchronous != "" {
+		queryParts = append(queryParts, fmt.Sprintf("_pragma=synchronous=%s", c.Synchronous))
+	}
+
+	if c.ForeignKeys {
+		queryParts = append(queryParts, "_pragma=foreign_keys=ON")
 	}
 
 	if len(queryParts) > 0 {

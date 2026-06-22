@@ -11,6 +11,7 @@ import (
 	"go4.org/netipx"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/views"
+	"tailscale.com/util/set"
 )
 
 // grantCategory classifies a grant by what per-node work it needs.
@@ -324,20 +325,32 @@ func (pol *Policy) compileOneGrant(
 		)
 	}
 
-	// Classify and store deferred self data.
-	switch {
-	case len(autogroupSelfDests) > 0:
+	// Classify and store deferred self data. The struct literal already
+	// initializes category to grantCategoryRegular (the zero value).
+	if len(autogroupSelfDests) > 0 {
 		cg.category = grantCategorySelf
 		cg.self = &selfGrantData{
 			resolvedSrcs:      resolvedSrcs,
 			internetProtocols: grant.InternetProtocols,
 			app:               grant.App,
 		}
-	default:
-		cg.category = grantCategoryRegular
 	}
 
 	return cg, nil
+}
+
+// mergeResolvedSrcs merges every prefix from the resolved sources into a
+// single [resolved] address set.
+func mergeResolvedSrcs(resolvedSrcs []ResolvedAddresses) (resolved, error) {
+	var b netipx.IPSetBuilder
+
+	for _, ips := range resolvedSrcs {
+		for _, pref := range ips.Prefixes() {
+			b.AddPrefix(pref)
+		}
+	}
+
+	return newResolved(&b)
 }
 
 // compileOneViaGrant resolves sources for a via grant and stores the
@@ -364,15 +377,7 @@ func (pol *Policy) compileOneViaGrant(
 	}
 
 	// Build merged SrcIPs.
-	var srcIPs netipx.IPSetBuilder
-
-	for _, ips := range resolvedSrcs {
-		for _, pref := range ips.Prefixes() {
-			srcIPs.AddPrefix(pref)
-		}
-	}
-
-	srcResolved, err := newResolved(&srcIPs)
+	srcResolved, err := mergeResolvedSrcs(resolvedSrcs)
 	if err != nil {
 		return nil, err
 	}
@@ -446,20 +451,8 @@ func buildSrcIPStrings(
 	hasWildcard, hasDangerAll bool,
 	nodes views.Slice[types.NodeView],
 ) []string {
-	var merged netipx.IPSetBuilder
-
-	for _, ips := range resolvedSrcs {
-		for _, pref := range ips.Prefixes() {
-			merged.AddPrefix(pref)
-		}
-	}
-
-	srcResolved, err := newResolved(&merged)
-	if err != nil {
-		return nil
-	}
-
-	if srcResolved.Empty() {
+	srcResolved, err := mergeResolvedSrcs(resolvedSrcs)
+	if err != nil || srcResolved.Empty() {
 		return nil
 	}
 
@@ -472,15 +465,12 @@ func buildSrcIPStrings(
 	// individual IPs from non-wildcard sources alongside the
 	// merged CGNAT ranges rather than absorbing them.
 	if hasWildcard && len(nonWildcardSrcs) > 0 {
-		seen := make(map[string]bool, len(srcIPStrs))
-		for _, s := range srcIPStrs {
-			seen[s] = true
-		}
+		seen := set.SetOf(srcIPStrs)
 
 		for _, ips := range nonWildcardSrcs {
 			for _, s := range ips.Strings() {
-				if !seen[s] {
-					seen[s] = true
+				if !seen.Contains(s) {
+					seen.Add(s)
 					srcIPStrs = append(srcIPStrs, s)
 				}
 			}
@@ -627,7 +617,7 @@ func collectRelayTargetIPs(grants []compiledGrant) (*netipx.IPSet, error) {
 // traffic through it must recompute when it goes offline. Returns nil when no
 // via grants exist.
 func collectViaTargetTags(grants []compiledGrant) map[Tag]struct{} {
-	var tags map[Tag]struct{}
+	tags := make(map[Tag]struct{})
 
 	for i := range grants {
 		if grants[i].via == nil {
@@ -635,12 +625,12 @@ func collectViaTargetTags(grants []compiledGrant) map[Tag]struct{} {
 		}
 
 		for _, t := range grants[i].via.viaTags {
-			if tags == nil {
-				tags = make(map[Tag]struct{})
-			}
-
 			tags[t] = struct{}{}
 		}
+	}
+
+	if len(tags) == 0 {
+		return nil
 	}
 
 	return tags

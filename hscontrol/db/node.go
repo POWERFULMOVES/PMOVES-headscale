@@ -1,10 +1,11 @@
 package db
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"net/netip"
-	"sort"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -30,6 +31,15 @@ const (
 // ErrNodeNameNotUnique is returned when a node name is not unique.
 var ErrNodeNameNotUnique = errors.New("node name is not unique")
 
+// preloadNode returns a session that eager-loads a node's AuthKey, the
+// AuthKey's User, and the node's User.
+func preloadNode(tx *gorm.DB) *gorm.DB {
+	return tx.
+		Preload("AuthKey").
+		Preload("AuthKey.User").
+		Preload("User")
+}
+
 var (
 	ErrNodeNotFound                  = errors.New("node not found")
 	ErrNodeRouteIsNotAvailable       = errors.New("route is not available on node")
@@ -52,17 +62,14 @@ func (hsdb *HSDatabase) ListPeers(nodeID types.NodeID, peerIDs ...types.NodeID) 
 func ListPeers(tx *gorm.DB, nodeID types.NodeID, peerIDs ...types.NodeID) (types.Nodes, error) {
 	nodes := types.Nodes{}
 
-	err := tx.
-		Preload("AuthKey").
-		Preload("AuthKey.User").
-		Preload("User").
+	err := preloadNode(tx).
 		Where("id <> ?", nodeID).
 		Where(peerIDs).Find(&nodes).Error
 	if err != nil {
 		return types.Nodes{}, err
 	}
 
-	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+	slices.SortFunc(nodes, func(a, b *types.Node) int { return cmp.Compare(a.ID, b.ID) })
 
 	return nodes, nil
 }
@@ -78,10 +85,7 @@ func (hsdb *HSDatabase) ListNodes(nodeIDs ...types.NodeID) (types.Nodes, error) 
 func ListNodes(tx *gorm.DB, nodeIDs ...types.NodeID) (types.Nodes, error) {
 	nodes := types.Nodes{}
 
-	err := tx.
-		Preload("AuthKey").
-		Preload("AuthKey.User").
-		Preload("User").
+	err := preloadNode(tx).
 		Where(nodeIDs).Find(&nodes).Error
 	if err != nil {
 		return nil, err
@@ -111,18 +115,22 @@ func (hsdb *HSDatabase) getNode(uid types.UserID, name string) (*types.Node, err
 
 // getNode finds a [types.Node] by name and user and returns the [types.Node] struct.
 func getNode(tx *gorm.DB, uid types.UserID, name string) (*types.Node, error) {
-	nodes, err := ListNodesByUser(tx, uid)
+	uidPtr := uint(uid)
+
+	node := types.Node{}
+
+	err := preloadNode(tx).
+		Where(&types.Node{UserID: &uidPtr, Hostname: name}).
+		First(&node).Error
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNodeNotFound
+		}
+
 		return nil, err
 	}
 
-	for _, m := range nodes {
-		if m.Hostname == name {
-			return m, nil
-		}
-	}
-
-	return nil, ErrNodeNotFound
+	return &node, nil
 }
 
 func (hsdb *HSDatabase) GetNodeByID(id types.NodeID) (*types.Node, error) {
@@ -132,32 +140,8 @@ func (hsdb *HSDatabase) GetNodeByID(id types.NodeID) (*types.Node, error) {
 // GetNodeByID finds a [types.Node] by ID and returns the [types.Node] struct.
 func GetNodeByID(tx *gorm.DB, id types.NodeID) (*types.Node, error) {
 	mach := types.Node{}
-	if result := tx.
-		Preload("AuthKey").
-		Preload("AuthKey.User").
-		Preload("User").
-		Find(&types.Node{ID: id}).First(&mach); result.Error != nil {
-		return nil, result.Error
-	}
-
-	return &mach, nil
-}
-
-func (hsdb *HSDatabase) GetNodeByMachineKey(machineKey key.MachinePublic) (*types.Node, error) {
-	return GetNodeByMachineKey(hsdb.DB, machineKey)
-}
-
-// GetNodeByMachineKey finds a [types.Node] by its [key.MachinePublic] and returns the [types.Node] struct.
-func GetNodeByMachineKey(
-	tx *gorm.DB,
-	machineKey key.MachinePublic,
-) (*types.Node, error) {
-	mach := types.Node{}
-	if result := tx.
-		Preload("AuthKey").
-		Preload("AuthKey.User").
-		Preload("User").
-		First(&mach, "machine_key = ?", machineKey.String()); result.Error != nil {
+	if result := preloadNode(tx).
+		First(&mach, "id = ?", id); result.Error != nil {
 		return nil, result.Error
 	}
 
@@ -174,10 +158,7 @@ func GetNodeByNodeKey(
 	nodeKey key.NodePublic,
 ) (*types.Node, error) {
 	mach := types.Node{}
-	if result := tx.
-		Preload("AuthKey").
-		Preload("AuthKey.User").
-		Preload("User").
+	if result := preloadNode(tx).
 		First(&mach, "node_key = ?", nodeKey.String()); result.Error != nil {
 		return nil, result.Error
 	}
@@ -297,12 +278,16 @@ func RegisterNodeForTest(tx *gorm.DB, node types.Node, ipv4 *netip.Addr, ipv6 *n
 
 	logEvent.Msg("registering test node")
 
-	// If the a new node is registered with the same machine key, to the same user,
-	// update the existing node.
-	// If the same node is registered again, but to a new user, then that is considered
-	// a new node.
-	oldNode, _ := GetNodeByMachineKey(tx, node.MachineKey)
-	if oldNode != nil && oldNode.UserID == node.UserID {
+	// Reuse the existing node's identity only when the same machine
+	// re-registers for the same user; a different user is a new node. Match on
+	// (machine_key, user_id) precisely - a machine key can map to several nodes
+	// (one per user), so a machine-key-only lookup would be ambiguous.
+	var oldNode types.Node
+
+	err := tx.
+		Where("machine_key = ? AND user_id = ?", node.MachineKey.String(), node.UserID).
+		First(&oldNode).Error
+	if err == nil {
 		node.ID = oldNode.ID
 		node.GivenName = oldNode.GivenName
 		node.ApprovedRoutes = oldNode.ApprovedRoutes
@@ -539,6 +524,15 @@ func (e *EphemeralGarbageCollector) Start() {
 	}
 }
 
+// firstOr returns the first non-empty option, or def if none is provided.
+func firstOr(def string, opt []string) string {
+	if len(opt) > 0 && opt[0] != "" {
+		return opt[0]
+	}
+
+	return def
+}
+
 func (hsdb *HSDatabase) CreateNodeForTest(user *types.User, hostname ...string) *types.Node {
 	if !testing.Testing() {
 		panic("CreateNodeForTest can only be called during tests")
@@ -548,10 +542,7 @@ func (hsdb *HSDatabase) CreateNodeForTest(user *types.User, hostname ...string) 
 		panic("CreateNodeForTest requires a valid user")
 	}
 
-	nodeName := defaultTestNodePrefix
-	if len(hostname) > 0 && hostname[0] != "" {
-		nodeName = hostname[0]
-	}
+	nodeName := firstOr(defaultTestNodePrefix, hostname)
 
 	// Create a preauth key for the node
 	pak, err := hsdb.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
@@ -621,10 +612,7 @@ func (hsdb *HSDatabase) CreateNodesForTest(user *types.User, count int, hostname
 		panic("CreateNodesForTest requires a valid user")
 	}
 
-	prefix := defaultTestNodePrefix
-	if len(hostnamePrefix) > 0 && hostnamePrefix[0] != "" {
-		prefix = hostnamePrefix[0]
-	}
+	prefix := firstOr(defaultTestNodePrefix, hostnamePrefix)
 
 	nodes := make([]*types.Node, count)
 	for i := range count {
@@ -644,10 +632,7 @@ func (hsdb *HSDatabase) CreateRegisteredNodesForTest(user *types.User, count int
 		panic("CreateRegisteredNodesForTest requires a valid user")
 	}
 
-	prefix := defaultTestNodePrefix
-	if len(hostnamePrefix) > 0 && hostnamePrefix[0] != "" {
-		prefix = hostnamePrefix[0]
-	}
+	prefix := firstOr(defaultTestNodePrefix, hostnamePrefix)
 
 	nodes := make([]*types.Node, count)
 	for i := range count {

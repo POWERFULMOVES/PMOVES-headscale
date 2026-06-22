@@ -10,13 +10,11 @@ import (
 	"strings"
 	"time"
 
-	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
 	"github.com/rs/zerolog"
 	"go4.org/netipx"
-	"google.golang.org/protobuf/types/known/timestamppb"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -78,10 +76,6 @@ type (
 	NodeIDs []NodeID
 )
 
-func (n NodeIDs) Len() int           { return len(n) }
-func (n NodeIDs) Less(i, j int) bool { return n[i] < n[j] }
-func (n NodeIDs) Swap(i, j int)      { n[i], n[j] = n[j], n[i] }
-
 func (id NodeID) StableID() tailcfg.StableNodeID {
 	return tailcfg.StableNodeID(strconv.FormatUint(uint64(id), util.Base10))
 }
@@ -96,6 +90,16 @@ func (id NodeID) Uint64() uint64 {
 
 func (id NodeID) String() string {
 	return strconv.FormatUint(id.Uint64(), util.Base10)
+}
+
+// StringID returns the node's id as a decimal string, the form the HTTP APIs
+// render it as.
+func (node *Node) StringID() string {
+	if node == nil {
+		return ""
+	}
+
+	return node.ID.String()
 }
 
 func ParseNodeID(s string) (NodeID, error) {
@@ -181,10 +185,21 @@ type Node struct {
 	// online. Written by the HA prober. Runtime-only.
 	Unhealthy bool `gorm:"-"`
 
-	// SessionEpoch identifies a poll session. Connect bumps it; a
-	// Disconnect carrying a stale value is dropped, so a deferred
-	// disconnect from a previous session cannot overwrite a newer
-	// Connect. Runtime-only.
+	// ActiveSessions counts live poll sessions for this node.
+	// [State.Connect] increments it and every session release
+	// ([State.Disconnect]) decrements it, so the node goes offline
+	// exactly when its last session ends — regardless of the order in
+	// which overlapping sessions' cleanups run. Never persisted, like
+	// SessionEpoch.
+	ActiveSessions int `gorm:"-"`
+
+	// SessionEpoch identifies a poll session generation; Connect bumps
+	// it. It complements ActiveSessions rather than duplicating it:
+	// the epoch is monotonic, which the HA prober needs to detect that
+	// a probe target reconnected mid-cycle — a refcount can return to
+	// its old value, a generation cannot. poll.go also uses the epoch
+	// returned by Connect as a "Connect ran" sentinel for its cleanup,
+	// and Disconnect logs it. Runtime-only.
 	SessionEpoch uint64 `gorm:"-"`
 }
 
@@ -236,13 +251,7 @@ func (node *Node) IPs() []netip.Addr {
 
 // HasIP reports if a node has a given IP address.
 func (node *Node) HasIP(i netip.Addr) bool {
-	for _, ip := range node.IPs() {
-		if ip.Compare(i) == 0 {
-			return true
-		}
-	}
-
-	return false
+	return slices.Contains(node.IPs(), i)
 }
 
 // IsTagged reports if a device is tagged and therefore should not be treated
@@ -482,55 +491,6 @@ func (nodes Nodes) ContainsNodeKey(nodeKey key.NodePublic) bool {
 	return false
 }
 
-func (node *Node) Proto() *v1.Node {
-	nodeProto := &v1.Node{
-		Id:         uint64(node.ID),
-		MachineKey: node.MachineKey.String(),
-
-		NodeKey:  node.NodeKey.String(),
-		DiscoKey: node.DiscoKey.String(),
-
-		// TODO(kradalby): replace list with v4, v6 field?
-		IpAddresses: node.IPsAsString(),
-		Name:        node.Hostname,
-		GivenName:   node.GivenName,
-		User:        nil, // Will be set below based on node type
-		Tags:        node.Tags,
-		Online:      node.IsOnline != nil && *node.IsOnline,
-
-		// Only ApprovedRoutes and AvailableRoutes is set here. SubnetRoutes has
-		// to be populated manually with PrimaryRoute, to ensure it includes the
-		// routes that are actively served from the node.
-		ApprovedRoutes:  util.PrefixesToString(node.ApprovedRoutes),
-		AvailableRoutes: util.PrefixesToString(node.AnnouncedRoutes()),
-
-		RegisterMethod: node.RegisterMethodToV1Enum(),
-
-		CreatedAt: timestamppb.New(node.CreatedAt),
-	}
-
-	// Set User field based on node ownership
-	// Note: User will be set to [TaggedDevices] in the gRPC layer (grpcv1.go)
-	// for proper [tailcfg.MapResponse] formatting
-	if node.User != nil {
-		nodeProto.User = node.User.Proto()
-	}
-
-	if node.AuthKey != nil {
-		nodeProto.PreAuthKey = node.AuthKey.Proto()
-	}
-
-	if node.LastSeen != nil {
-		nodeProto.LastSeen = timestamppb.New(*node.LastSeen)
-	}
-
-	if node.Expiry != nil {
-		nodeProto.Expiry = timestamppb.New(*node.Expiry)
-	}
-
-	return nodeProto
-}
-
 func (node *Node) GetFQDN(baseDomain string) (string, error) {
 	if node.GivenName == "" {
 		return "", fmt.Errorf("creating valid FQDN: %w", ErrNodeHasNoGivenName)
@@ -573,11 +533,9 @@ func (node *Node) AnnouncedRoutes() []netip.Prefix {
 // announces and are approved. Also used by [Node.CanAccess] and [Node.CanAccessRoute] as part
 // of the subnet-router-as-source identity.
 //
-// IMPORTANT: This method is used for internal data structures and should NOT be
-// used for the gRPC Proto conversion. For Proto, SubnetRoutes must be populated
-// manually with PrimaryRoutes to ensure it includes only routes actively served
-// by the node. See the comment in [Node.Proto] method and the implementation in
-// grpcv1.go/nodesToProto.
+// IMPORTANT: This method reflects announced-and-approved routes. API
+// responses that need the routes actively served by the node must
+// populate SubnetRoutes from the primary-route election instead.
 func (node *Node) SubnetRoutes() []netip.Prefix {
 	var routes []netip.Prefix
 
@@ -657,23 +615,11 @@ func (node *Node) PeerChangeFromMapRequest(req tailcfg.MapRequest) tailcfg.PeerC
 		ret.DiscoKey = &req.DiscoKey
 	}
 
-	if node.Hostinfo != nil &&
-		node.Hostinfo.NetInfo != nil &&
-		req.Hostinfo != nil &&
-		req.Hostinfo.NetInfo != nil &&
-		node.Hostinfo.NetInfo.PreferredDERP != req.Hostinfo.NetInfo.PreferredDERP {
-		ret.DERPRegion = req.Hostinfo.NetInfo.PreferredDERP
-	}
-
 	if req.Hostinfo != nil && req.Hostinfo.NetInfo != nil {
-		// If there is no stored Hostinfo or NetInfo, use
-		// the new PreferredDERP.
-		if node.Hostinfo == nil {
-			ret.DERPRegion = req.Hostinfo.NetInfo.PreferredDERP
-		} else if node.Hostinfo.NetInfo == nil {
-			ret.DERPRegion = req.Hostinfo.NetInfo.PreferredDERP
-		} else if node.Hostinfo.NetInfo.PreferredDERP != req.Hostinfo.NetInfo.PreferredDERP {
-			// If there is a PreferredDERP check if it has changed.
+		// Use the new PreferredDERP when there is no stored Hostinfo or
+		// NetInfo, or when the stored PreferredDERP has changed.
+		if node.Hostinfo == nil || node.Hostinfo.NetInfo == nil ||
+			node.Hostinfo.NetInfo.PreferredDERP != req.Hostinfo.NetInfo.PreferredDERP {
 			ret.DERPRegion = req.Hostinfo.NetInfo.PreferredDERP
 		}
 	}
@@ -692,36 +638,7 @@ func (node *Node) PeerChangeFromMapRequest(req tailcfg.MapRequest) tailcfg.PeerC
 // EndpointsChanged compares two endpoint slices and returns true if they differ.
 // The comparison is order-independent - endpoints are sorted before comparison.
 func EndpointsChanged(oldEndpoints, newEndpoints []netip.AddrPort) bool {
-	if len(oldEndpoints) != len(newEndpoints) {
-		return true
-	}
-
-	if len(oldEndpoints) == 0 {
-		return false
-	}
-
-	// Make copies to avoid modifying the original slices
-	oldCopy := slices.Clone(oldEndpoints)
-	newCopy := slices.Clone(newEndpoints)
-
-	// Sort both slices to enable order-independent comparison
-	slices.SortFunc(oldCopy, netip.AddrPort.Compare)
-	slices.SortFunc(newCopy, netip.AddrPort.Compare)
-
-	return !slices.Equal(oldCopy, newCopy)
-}
-
-func (node *Node) RegisterMethodToV1Enum() v1.RegisterMethod {
-	switch node.RegisterMethod {
-	case "authkey":
-		return v1.RegisterMethod_REGISTER_METHOD_AUTH_KEY
-	case "oidc":
-		return v1.RegisterMethod_REGISTER_METHOD_OIDC
-	case "cli":
-		return v1.RegisterMethod_REGISTER_METHOD_CLI
-	default:
-		return v1.RegisterMethod_REGISTER_METHOD_UNSPECIFIED
-	}
+	return !equalUnordered(oldEndpoints, newEndpoints, netip.AddrPort.Compare)
 }
 
 // ApplyPeerChange takes a [tailcfg.PeerChange] struct and updates the node.
@@ -945,6 +862,16 @@ func (nv NodeView) RequestTagsSlice() views.Slice[string] {
 	return nv.Hostinfo().RequestTags()
 }
 
+// StringID returns the node's id as a decimal string, the form the HTTP APIs
+// render it as.
+func (nv NodeView) StringID() string {
+	if !nv.Valid() {
+		return ""
+	}
+
+	return nv.ID().String()
+}
+
 // IsTagged reports if a device is tagged
 // and therefore should not be treated as a
 // user owned device.
@@ -1023,15 +950,6 @@ func (nv NodeView) RequestTags() []string {
 	}
 
 	return nv.Hostinfo().RequestTags().AsSlice()
-}
-
-// Proto converts the [NodeView] to a protobuf representation.
-func (nv NodeView) Proto() *v1.Node {
-	if !nv.Valid() {
-		return nil
-	}
-
-	return nv.ж.Proto()
 }
 
 // HasIP reports if a node has a given IP address.
@@ -1130,6 +1048,13 @@ func (nv NodeView) HasNetworkChanges(other NodeView) bool {
 // prefixes, order-independent. Inputs are cloned before sorting so
 // callers' slices are not mutated.
 func equalPrefixesUnordered(a, b []netip.Prefix) bool {
+	return equalUnordered(a, b, netip.Prefix.Compare)
+}
+
+// equalUnordered reports whether a and b contain the same elements,
+// order-independent. Inputs are cloned before sorting so callers'
+// slices are not mutated.
+func equalUnordered[E comparable](a, b []E, cmp func(E, E) int) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -1137,8 +1062,8 @@ func equalPrefixesUnordered(a, b []netip.Prefix) bool {
 	ac := slices.Clone(a)
 	bc := slices.Clone(b)
 
-	slices.SortFunc(ac, netip.Prefix.Compare)
-	slices.SortFunc(bc, netip.Prefix.Compare)
+	slices.SortFunc(ac, cmp)
+	slices.SortFunc(bc, cmp)
 
 	return slices.Equal(ac, bc)
 }
