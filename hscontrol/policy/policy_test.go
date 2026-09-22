@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net/netip"
 	"testing"
-	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
@@ -14,7 +13,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
-	"tailscale.com/types/ptr"
 )
 
 var ap = func(ipStr string) *netip.Addr {
@@ -33,6 +31,7 @@ func TestReduceNodes(t *testing.T) {
 		rules []tailcfg.FilterRule
 		node  *types.Node
 	}
+
 	tests := []struct {
 		name string
 		args args
@@ -768,6 +767,65 @@ func TestReduceNodes(t *testing.T) {
 				},
 			},
 		},
+		// Subnet-to-subnet: routers must see each other when ACL
+		// uses only subnet CIDRs. Issue #3157.
+		{
+			name: "subnet-to-subnet-routers-see-each-other-3157",
+			args: args{
+				nodes: []*types.Node{
+					{
+						ID:       1,
+						IPv4:     ap("100.64.0.1"),
+						Hostname: "router-a",
+						User:     &types.User{Name: "router-a"},
+						Hostinfo: &tailcfg.Hostinfo{
+							RoutableIPs: []netip.Prefix{netip.MustParsePrefix("10.88.8.0/24")},
+						},
+						ApprovedRoutes: []netip.Prefix{netip.MustParsePrefix("10.88.8.0/24")},
+					},
+					{
+						ID:       2,
+						IPv4:     ap("100.64.0.2"),
+						Hostname: "router-b",
+						User:     &types.User{Name: "router-b"},
+						Hostinfo: &tailcfg.Hostinfo{
+							RoutableIPs: []netip.Prefix{netip.MustParsePrefix("10.99.9.0/24")},
+						},
+						ApprovedRoutes: []netip.Prefix{netip.MustParsePrefix("10.99.9.0/24")},
+					},
+				},
+				rules: []tailcfg.FilterRule{
+					{
+						SrcIPs: []string{"10.88.8.0/24"},
+						DstPorts: []tailcfg.NetPortRange{
+							{IP: "10.99.9.0/24", Ports: tailcfg.PortRangeAny},
+						},
+					},
+				},
+				node: &types.Node{
+					ID:       1,
+					IPv4:     ap("100.64.0.1"),
+					Hostname: "router-a",
+					User:     &types.User{Name: "router-a"},
+					Hostinfo: &tailcfg.Hostinfo{
+						RoutableIPs: []netip.Prefix{netip.MustParsePrefix("10.88.8.0/24")},
+					},
+					ApprovedRoutes: []netip.Prefix{netip.MustParsePrefix("10.88.8.0/24")},
+				},
+			},
+			want: []*types.Node{
+				{
+					ID:       2,
+					IPv4:     ap("100.64.0.2"),
+					Hostname: "router-b",
+					User:     &types.User{Name: "router-b"},
+					Hostinfo: &tailcfg.Hostinfo{
+						RoutableIPs: []netip.Prefix{netip.MustParsePrefix("10.99.9.0/24")},
+					},
+					ApprovedRoutes: []netip.Prefix{netip.MustParsePrefix("10.99.9.0/24")},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -783,9 +841,11 @@ func TestReduceNodes(t *testing.T) {
 			for _, v := range gotViews.All() {
 				got = append(got, v.AsStruct())
 			}
+
 			if diff := cmp.Diff(tt.want, got, util.Comparers...); diff != "" {
 				t.Errorf("ReduceNodes() unexpected result (-want +got):\n%s", diff)
 				t.Log("Matchers: ")
+
 				for _, m := range matchers {
 					t.Log("\t+", m.DebugString())
 				}
@@ -796,7 +856,7 @@ func TestReduceNodes(t *testing.T) {
 
 func TestReduceNodesFromPolicy(t *testing.T) {
 	n := func(id types.NodeID, ip, hostname, username string, routess ...string) *types.Node {
-		var routes []netip.Prefix
+		routes := make([]netip.Prefix, 0, len(routess))
 		for _, route := range routess {
 			routes = append(routes, netip.MustParsePrefix(route))
 		}
@@ -891,11 +951,13 @@ func TestReduceNodesFromPolicy(t *testing.T) {
   ]
 }`,
 			node: n(1, "100.64.0.1", "mobile", "mobile"),
-			// autogroup:internet does not generate packet filters - it's handled
-			// by exit node routing via AllowedIPs, not by packet filtering.
-			// Only server is visible through the mobile -> server:80 rule.
+			// autogroup:internet emits no client packet filter, but it
+			// must still produce a matcher: Node.CanAccess uses
+			// matcher.DestsIsTheInternet() + IsExitNode() to surface
+			// exit-node peers (juanfont/headscale#3212).
 			want: types.Nodes{
 				n(2, "100.64.0.2", "server", "server"),
+				n(3, "100.64.0.3", "exit", "server", "0.0.0.0/0", "::/0"),
 			},
 			wantMatchers: 1,
 		},
@@ -1034,8 +1096,11 @@ func TestReduceNodesFromPolicy(t *testing.T) {
 	for _, tt := range tests {
 		for idx, pmf := range PolicyManagerFuncsForTest([]byte(tt.policy)) {
 			t.Run(fmt.Sprintf("%s-index%d", tt.name, idx), func(t *testing.T) {
-				var pm PolicyManager
-				var err error
+				var (
+					pm  PolicyManager
+					err error
+				)
+
 				pm, err = pmf(nil, tt.nodes.ViewSlice())
 				require.NoError(t, err)
 
@@ -1053,9 +1118,11 @@ func TestReduceNodesFromPolicy(t *testing.T) {
 				for _, v := range gotViews.All() {
 					got = append(got, v.AsStruct())
 				}
+
 				if diff := cmp.Diff(tt.want, got, util.Comparers...); diff != "" {
 					t.Errorf("TestReduceNodesFromPolicy() unexpected result (-want +got):\n%s", diff)
 					t.Log("Matchers: ")
+
 					for _, m := range matchers {
 						t.Log("\t+", m.DebugString())
 					}
@@ -1070,27 +1137,29 @@ func TestSSHPolicyRules(t *testing.T) {
 		{Name: "user1", Model: gorm.Model{ID: 1}},
 		{Name: "user2", Model: gorm.Model{ID: 2}},
 		{Name: "user3", Model: gorm.Model{ID: 3}},
+		{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 4}},
+		{Name: "bob", Email: "bob@example.com", Model: gorm.Model{ID: 5}},
 	}
 
 	// Create standard node setups used across tests
 	nodeUser1 := types.Node{
 		Hostname: "user1-device",
 		IPv4:     ap("100.64.0.1"),
-		UserID:   ptr.To(uint(1)),
-		User:     ptr.To(users[0]),
+		UserID:   new(uint(1)),
+		User:     new(users[0]),
 	}
 	nodeUser2 := types.Node{
 		Hostname: "user2-device",
 		IPv4:     ap("100.64.0.2"),
-		UserID:   ptr.To(uint(2)),
-		User:     ptr.To(users[1]),
+		UserID:   new(uint(2)),
+		User:     new(users[1]),
 	}
 
 	taggedClient := types.Node{
 		Hostname: "tagged-client",
 		IPv4:     ap("100.64.0.4"),
-		UserID:   ptr.To(uint(2)),
-		User:     ptr.To(users[1]),
+		UserID:   new(uint(2)),
+		User:     new(users[1]),
 		Tags:     []string{"tag:client"},
 	}
 
@@ -1098,9 +1167,23 @@ func TestSSHPolicyRules(t *testing.T) {
 	nodeTaggedServer := types.Node{
 		Hostname: "tagged-server",
 		IPv4:     ap("100.64.0.5"),
-		UserID:   ptr.To(uint(1)),
-		User:     ptr.To(users[0]),
+		UserID:   new(uint(1)),
+		User:     new(users[0]),
 		Tags:     []string{"tag:server"},
+	}
+
+	// Nodes for localpart tests (users with email addresses)
+	nodeAlice := types.Node{
+		Hostname: "alice-device",
+		IPv4:     ap("100.64.0.6"),
+		UserID:   new(uint(4)),
+		User:     new(users[3]),
+	}
+	nodeBob := types.Node{
+		Hostname: "bob-device",
+		IPv4:     ap("100.64.0.7"),
+		UserID:   new(uint(5)),
+		User:     new(users[4]),
 	}
 
 	tests := []struct {
@@ -1181,11 +1264,12 @@ func TestSSHPolicyRules(t *testing.T) {
 						"root": "",
 					},
 					Action: &tailcfg.SSHAction{
-						Accept:                    true,
-						SessionDuration:           24 * time.Hour,
-						AllowAgentForwarding:      true,
-						AllowLocalPortForwarding:  true,
-						AllowRemotePortForwarding: true,
+						Accept:                    false,
+						SessionDuration:           0,
+						HoldAndDelegate:           "unused-url/machine/ssh/action/$SRC_NODE_ID/to/$DST_NODE_ID?local_user=$LOCAL_USER",
+						AllowAgentForwarding:      false,
+						AllowLocalPortForwarding:  false,
+						AllowRemotePortForwarding: false,
 					},
 				},
 			}},
@@ -1233,7 +1317,7 @@ func TestSSHPolicyRules(t *testing.T) {
 				]
 			}`,
 			expectErr:    true,
-			errorMessage: `invalid SSH action "invalid", must be one of: accept, check`,
+			errorMessage: `"invalid" is not a valid action`,
 		},
 		{
 			name:       "invalid-check-period",
@@ -1257,10 +1341,15 @@ func TestSSHPolicyRules(t *testing.T) {
 				]
 			}`,
 			expectErr:    true,
-			errorMessage: "not a valid duration string",
+			errorMessage: `time: invalid duration "invalid"`,
 		},
+		// `autogroup:invalid` as an SSH user is no longer rejected:
+		// SaaS treats every `autogroup:*` user-string as a literal
+		// label and compiles it into the SSHUsers map. The compat
+		// suite covers this via ssh-malformed-user-autogroup-* — no
+		// dedicated case is needed here.
 		{
-			name:       "unsupported-autogroup",
+			name:       "ssh-user-unknown-autogroup-as-literal",
 			targetNode: taggedClient,
 			peers:      types.Nodes{&nodeUser2},
 			policy: `{
@@ -1279,8 +1368,23 @@ func TestSSHPolicyRules(t *testing.T) {
 					}
 				]
 			}`,
-			expectErr:    true,
-			errorMessage: "autogroup \"autogroup:invalid\" is not supported",
+			wantSSH: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+				{
+					Principals: []*tailcfg.SSHPrincipal{
+						{NodeIP: "100.64.0.2"},
+					},
+					SSHUsers: map[string]string{
+						"autogroup:invalid": "autogroup:invalid",
+						"root":              "",
+					},
+					Action: &tailcfg.SSHAction{
+						Accept:                    true,
+						AllowAgentForwarding:      true,
+						AllowLocalPortForwarding:  true,
+						AllowRemotePortForwarding: true,
+					},
+				},
+			}},
 		},
 		{
 			name:       "autogroup-nonroot-should-use-wildcard-with-root-excluded",
@@ -1438,7 +1542,110 @@ func TestSSHPolicyRules(t *testing.T) {
 					},
 					SSHUsers: map[string]string{
 						"debian": "debian",
+						"root":   "",
 					},
+					Action: &tailcfg.SSHAction{
+						Accept:                    true,
+						AllowAgentForwarding:      true,
+						AllowLocalPortForwarding:  true,
+						AllowRemotePortForwarding: true,
+					},
+				},
+			}},
+		},
+		{
+			name:       "localpart-maps-email-to-os-user",
+			targetNode: nodeTaggedServer,
+			peers:      types.Nodes{&nodeAlice, &nodeBob},
+			policy: `{
+				"tagOwners": {
+					"tag:server": ["alice@example.com"]
+				},
+				"ssh": [
+					{
+						"action": "accept",
+						"src": ["autogroup:member"],
+						"dst": ["tag:server"],
+						"users": ["localpart:*@example.com"]
+					}
+				]
+			}`,
+			// Per-user common+localpart interleaved: each user gets root deny then localpart.
+			wantSSH: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.6"}},
+					SSHUsers:   map[string]string{"root": ""},
+					Action: &tailcfg.SSHAction{
+						Accept:                    true,
+						AllowAgentForwarding:      true,
+						AllowLocalPortForwarding:  true,
+						AllowRemotePortForwarding: true,
+					},
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.6"}},
+					SSHUsers:   map[string]string{"alice": "alice"},
+					Action: &tailcfg.SSHAction{
+						Accept:                    true,
+						AllowAgentForwarding:      true,
+						AllowLocalPortForwarding:  true,
+						AllowRemotePortForwarding: true,
+					},
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.7"}},
+					SSHUsers:   map[string]string{"root": ""},
+					Action: &tailcfg.SSHAction{
+						Accept:                    true,
+						AllowAgentForwarding:      true,
+						AllowLocalPortForwarding:  true,
+						AllowRemotePortForwarding: true,
+					},
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.7"}},
+					SSHUsers:   map[string]string{"bob": "bob"},
+					Action: &tailcfg.SSHAction{
+						Accept:                    true,
+						AllowAgentForwarding:      true,
+						AllowLocalPortForwarding:  true,
+						AllowRemotePortForwarding: true,
+					},
+				},
+			}},
+		},
+		{
+			name:       "localpart-combined-with-root",
+			targetNode: nodeTaggedServer,
+			peers:      types.Nodes{&nodeAlice},
+			policy: `{
+				"tagOwners": {
+					"tag:server": ["alice@example.com"]
+				},
+				"ssh": [
+					{
+						"action": "accept",
+						"src": ["autogroup:member"],
+						"dst": ["tag:server"],
+						"users": ["localpart:*@example.com", "root"]
+					}
+				]
+			}`,
+			// Common root rule followed by alice's per-user localpart rule (interleaved).
+			wantSSH: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.6"}},
+					SSHUsers:   map[string]string{"root": "root"},
+					Action: &tailcfg.SSHAction{
+						Accept:                    true,
+						AllowAgentForwarding:      true,
+						AllowLocalPortForwarding:  true,
+						AllowRemotePortForwarding: true,
+					},
+				},
+				{
+					Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.6"}},
+					SSHUsers:   map[string]string{"alice": "alice"},
 					Action: &tailcfg.SSHAction{
 						Accept:                    true,
 						AllowAgentForwarding:      true,
@@ -1453,19 +1660,23 @@ func TestSSHPolicyRules(t *testing.T) {
 	for _, tt := range tests {
 		for idx, pmf := range PolicyManagerFuncsForTest([]byte(tt.policy)) {
 			t.Run(fmt.Sprintf("%s-index%d", tt.name, idx), func(t *testing.T) {
-				var pm PolicyManager
-				var err error
+				var (
+					pm  PolicyManager
+					err error
+				)
+
 				pm, err = pmf(users, append(tt.peers, &tt.targetNode).ViewSlice())
 
 				if tt.expectErr {
 					require.Error(t, err)
 					require.Contains(t, err.Error(), tt.errorMessage)
+
 					return
 				}
 
 				require.NoError(t, err)
 
-				got, err := pm.SSHPolicy(tt.targetNode.View())
+				got, err := pm.SSHPolicy("unused-url", tt.targetNode.View())
 				require.NoError(t, err)
 
 				if diff := cmp.Diff(tt.wantSSH, got); diff != "" {
@@ -1482,6 +1693,7 @@ func TestReduceRoutes(t *testing.T) {
 		routes []netip.Prefix
 		rules  []tailcfg.FilterRule
 	}
+
 	tests := []struct {
 		name string
 		args args
@@ -2098,11 +2310,133 @@ func TestReduceRoutes(t *testing.T) {
 				netip.MustParsePrefix("192.168.1.0/14"),
 			},
 		},
+		// Subnet-to-subnet tests for issue #3157.
+		// When an ACL references subnet CIDRs as both source and destination,
+		// the subnet routers for those subnets must receive routes to each
+		// other's subnets.
+		{
+			name: "subnet-to-subnet-src-router-gets-dst-route-3157",
+			args: args{
+				node: &types.Node{
+					ID:   1,
+					IPv4: ap("100.64.0.1"),
+					User: &types.User{Name: "router-a"},
+					Hostinfo: &tailcfg.Hostinfo{
+						RoutableIPs: []netip.Prefix{
+							netip.MustParsePrefix("10.88.8.0/24"),
+						},
+					},
+					ApprovedRoutes: []netip.Prefix{
+						netip.MustParsePrefix("10.88.8.0/24"),
+					},
+				},
+				routes: []netip.Prefix{
+					netip.MustParsePrefix("10.99.9.0/24"),
+				},
+				rules: []tailcfg.FilterRule{
+					{
+						SrcIPs: []string{"10.88.8.0/24"},
+						DstPorts: []tailcfg.NetPortRange{
+							{IP: "10.99.9.0/24", Ports: tailcfg.PortRangeAny},
+						},
+					},
+				},
+			},
+			want: []netip.Prefix{
+				netip.MustParsePrefix("10.99.9.0/24"),
+			},
+		},
+		{
+			name: "subnet-to-subnet-dst-router-gets-src-route-3157",
+			args: args{
+				node: &types.Node{
+					ID:   2,
+					IPv4: ap("100.64.0.2"),
+					User: &types.User{Name: "router-b"},
+					Hostinfo: &tailcfg.Hostinfo{
+						RoutableIPs: []netip.Prefix{
+							netip.MustParsePrefix("10.99.9.0/24"),
+						},
+					},
+					ApprovedRoutes: []netip.Prefix{
+						netip.MustParsePrefix("10.99.9.0/24"),
+					},
+				},
+				routes: []netip.Prefix{
+					netip.MustParsePrefix("10.88.8.0/24"),
+				},
+				rules: []tailcfg.FilterRule{
+					{
+						SrcIPs: []string{"10.88.8.0/24"},
+						DstPorts: []tailcfg.NetPortRange{
+							{IP: "10.99.9.0/24", Ports: tailcfg.PortRangeAny},
+						},
+					},
+				},
+			},
+			want: []netip.Prefix{
+				netip.MustParsePrefix("10.88.8.0/24"),
+			},
+		},
+		{
+			name: "subnet-to-subnet-regular-node-no-route-leak-3157",
+			args: args{
+				node: &types.Node{
+					ID:   3,
+					IPv4: ap("100.64.0.3"),
+					User: &types.User{Name: "regular-node"},
+				},
+				routes: []netip.Prefix{
+					netip.MustParsePrefix("10.88.8.0/24"),
+					netip.MustParsePrefix("10.99.9.0/24"),
+				},
+				rules: []tailcfg.FilterRule{
+					{
+						SrcIPs: []string{"10.88.8.0/24"},
+						DstPorts: []tailcfg.NetPortRange{
+							{IP: "10.99.9.0/24", Ports: tailcfg.PortRangeAny},
+						},
+					},
+				},
+			},
+			want: nil,
+		},
+		{
+			name: "subnet-to-subnet-unrelated-router-no-route-leak-3157",
+			args: args{
+				node: &types.Node{
+					ID:   4,
+					IPv4: ap("100.64.0.4"),
+					User: &types.User{Name: "router-c"},
+					Hostinfo: &tailcfg.Hostinfo{
+						RoutableIPs: []netip.Prefix{
+							netip.MustParsePrefix("172.16.0.0/24"),
+						},
+					},
+					ApprovedRoutes: []netip.Prefix{
+						netip.MustParsePrefix("172.16.0.0/24"),
+					},
+				},
+				routes: []netip.Prefix{
+					netip.MustParsePrefix("10.88.8.0/24"),
+				},
+				rules: []tailcfg.FilterRule{
+					{
+						SrcIPs: []string{"10.88.8.0/24"},
+						DstPorts: []tailcfg.NetPortRange{
+							{IP: "10.99.9.0/24", Ports: tailcfg.PortRangeAny},
+						},
+					},
+				},
+			},
+			want: nil,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			matchers := matcher.MatchesFromFilterRules(tt.args.rules)
+
 			got := ReduceRoutes(
 				tt.args.node.View(),
 				tt.args.routes,

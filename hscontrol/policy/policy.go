@@ -9,7 +9,6 @@ import (
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog/log"
 	"github.com/samber/lo"
-	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/views"
 )
 
@@ -51,35 +50,9 @@ func ReduceRoutes(
 	return result
 }
 
-// BuildPeerMap builds a map of all peers that can be accessed by each node.
-func BuildPeerMap(
-	nodes views.Slice[types.NodeView],
-	matchers []matcher.Match,
-) map[types.NodeID][]types.NodeView {
-	ret := make(map[types.NodeID][]types.NodeView, nodes.Len())
-
-	// Build the map of all peers according to the matchers.
-	// Compared to ReduceNodes, which builds the list per node, we end up with doing
-	// the full work for every node (On^2), while this will reduce the list as we see
-	// relationships while building the map, making it O(n^2/2) in the end, but with less work per node.
-	for i := range nodes.Len() {
-		for j := i + 1; j < nodes.Len(); j++ {
-			if nodes.At(i).ID() == nodes.At(j).ID() {
-				continue
-			}
-
-			if nodes.At(i).CanAccess(matchers, nodes.At(j)) || nodes.At(j).CanAccess(matchers, nodes.At(i)) {
-				ret[nodes.At(i).ID()] = append(ret[nodes.At(i).ID()], nodes.At(j))
-				ret[nodes.At(j).ID()] = append(ret[nodes.At(j).ID()], nodes.At(i))
-			}
-		}
-	}
-
-	return ret
-}
-
 // ApproveRoutesWithPolicy checks if the node can approve the announced routes
-// and returns the new list of approved routes.
+// and returns the new list of approved routes. The [PolicyManager] is consulted
+// via [PolicyManager.NodeCanApproveRoute].
 // The approved routes will include:
 // 1. ALL previously approved routes (regardless of whether they're still advertised)
 // 2. New routes from announcedRoutes that can be auto-approved by policy
@@ -111,7 +84,7 @@ func ApproveRoutesWithPolicy(pm PolicyManager, nv types.NodeView, currentApprove
 	}
 
 	// Sort and deduplicate
-	tsaddr.SortPrefixes(newApproved)
+	slices.SortFunc(newApproved, netip.Prefix.Compare)
 	newApproved = slices.Compact(newApproved)
 	newApproved = lo.Filter(newApproved, func(route netip.Prefix, index int) bool {
 		return route.IsValid()
@@ -120,12 +93,13 @@ func ApproveRoutesWithPolicy(pm PolicyManager, nv types.NodeView, currentApprove
 	// Sort the current approved for comparison
 	sortedCurrent := make([]netip.Prefix, len(currentApproved))
 	copy(sortedCurrent, currentApproved)
-	tsaddr.SortPrefixes(sortedCurrent)
+	slices.SortFunc(sortedCurrent, netip.Prefix.Compare)
 
 	// Only update if the routes actually changed
 	if !slices.Equal(sortedCurrent, newApproved) {
 		// Log what changed
 		var added, kept []netip.Prefix
+
 		for _, route := range newApproved {
 			if !slices.Contains(sortedCurrent, route) {
 				added = append(added, route)

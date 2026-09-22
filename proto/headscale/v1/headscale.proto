@@ -8,6 +8,7 @@ import "headscale/v1/user.proto";
 import "headscale/v1/preauthkey.proto";
 import "headscale/v1/node.proto";
 import "headscale/v1/apikey.proto";
+import "headscale/v1/auth.proto";
 import "headscale/v1/policy.proto";
 
 service HeadscaleService {
@@ -139,6 +140,29 @@ service HeadscaleService {
 
   // --- Node end ---
 
+  // --- Auth start ---
+  rpc AuthRegister(AuthRegisterRequest) returns (AuthRegisterResponse) {
+    option (google.api.http) = {
+      post : "/api/v1/auth/register"
+      body : "*"
+    };
+  }
+
+  rpc AuthApprove(AuthApproveRequest) returns (AuthApproveResponse) {
+    option (google.api.http) = {
+      post : "/api/v1/auth/approve"
+      body : "*"
+    };
+  }
+
+  rpc AuthReject(AuthRejectRequest) returns (AuthRejectResponse) {
+    option (google.api.http) = {
+      post : "/api/v1/auth/reject"
+      body : "*"
+    };
+  }
+  // --- Auth end ---
+
   // --- ApiKeys start ---
   rpc CreateApiKey(CreateApiKeyRequest) returns (CreateApiKeyResponse) {
     option (google.api.http) = {
@@ -177,6 +201,13 @@ service HeadscaleService {
   rpc SetPolicy(SetPolicyRequest) returns (SetPolicyResponse) {
     option (google.api.http) = {
       put : "/api/v1/policy"
+      body : "*"
+    };
+  }
+
+  rpc CheckPolicy(CheckPolicyRequest) returns (CheckPolicyResponse) {
+    option (google.api.http) = {
+      post : "/api/v1/policy/check"
       body : "*"
     };
   }

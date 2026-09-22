@@ -2,6 +2,7 @@ package policy
 
 import (
 	"net/netip"
+	"time"
 
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
@@ -19,27 +20,69 @@ type PolicyManager interface {
 	MatchersForNode(node types.NodeView) ([]matcher.Match, error)
 	// BuildPeerMap constructs peer relationship maps for the given nodes
 	BuildPeerMap(nodes views.Slice[types.NodeView]) map[types.NodeID][]types.NodeView
-	SSHPolicy(types.NodeView) (*tailcfg.SSHPolicy, error)
-	SetPolicy([]byte) (bool, error)
+	SSHPolicy(baseURL string, node types.NodeView) (*tailcfg.SSHPolicy, error)
+	// SSHCheckParams resolves the SSH check period for a (src, dst) pair
+	// from the current policy, avoiding trust of client-provided URL params.
+	SSHCheckParams(srcNodeID, dstNodeID types.NodeID) (time.Duration, bool)
+	SetPolicy(pol []byte) (bool, error)
 	SetUsers(users []types.User) (bool, error)
 	SetNodes(nodes views.Slice[types.NodeView]) (bool, error)
 	// NodeCanHaveTag reports whether the given node can have the given tag.
-	NodeCanHaveTag(types.NodeView, string) bool
+	NodeCanHaveTag(node types.NodeView, tag string) bool
 
 	// TagExists reports whether the given tag is defined in the policy.
 	TagExists(tag string) bool
 
 	// NodeCanApproveRoute reports whether the given node can approve the given route.
-	NodeCanApproveRoute(types.NodeView, netip.Prefix) bool
+	NodeCanApproveRoute(node types.NodeView, route netip.Prefix) bool
+
+	// NodeNeedsPeerRecompute reports whether peers must recompute their
+	// netmap when the node's online state changes. True for subnet
+	// routers, relay targets (tailscale.com/cap/relay), and via targets;
+	// false for ordinary nodes, which only need a lightweight online or
+	// offline peer patch. [State.Connect] and [State.Disconnect] use it to
+	// avoid a tailnet-wide recompute on every ordinary reconnect.
+	NodeNeedsPeerRecompute(node types.NodeView) bool
+
+	// ViaRoutesForPeer computes via grant effects for a viewer-peer pair.
+	// It returns which routes should be included (peer is via-designated for viewer)
+	// and excluded (steered to a different peer). When no via grants apply,
+	// both fields are empty and the caller falls back to existing behavior.
+	ViaRoutesForPeer(viewer, peer types.NodeView) types.ViaRouteResult
+
+	// NodeCapMap returns the policy-derived CapMap for the given node,
+	// or nil when no nodeAttrs entry targets it. The returned map is
+	// owned by the manager; treat it as read-only and copy before
+	// merging into a [tailcfg.Node]. It describes the node's own
+	// capabilities, not a per-viewer view.
+	NodeCapMap(id types.NodeID) tailcfg.NodeCapMap
+
+	// NodeCapMaps returns a snapshot of the per-node policy CapMap so
+	// callers can amortise lock acquisitions over a peer loop. The
+	// outer map is a fresh container; the inner [tailcfg.NodeCapMap]
+	// values are shared with the manager and read-only.
+	NodeCapMaps() map[types.NodeID]tailcfg.NodeCapMap
+
+	// NodesWithChangedCapMap returns the IDs of nodes whose nodeAttrs
+	// CapMap shifted during recent updateLocked calls. The buffer
+	// drains on read; callers consume it once per update cycle to
+	// decide which nodes need a self-targeted MapResponse.
+	// refreshNodeAttrsLocked appends to the buffer rather than
+	// overwriting, so a SetUsers/SetNodes between SetPolicy and the
+	// drain cannot lose the policy-reload diff.
+	NodesWithChangedCapMap() []types.NodeID
 
 	Version() int
 	DebugString() string
 }
 
-// NewPolicyManager returns a new policy manager.
+// NewPolicyManager returns a new [PolicyManager].
 func NewPolicyManager(pol []byte, users []types.User, nodes views.Slice[types.NodeView]) (PolicyManager, error) {
-	var polMan PolicyManager
-	var err error
+	var (
+		polMan PolicyManager
+		err    error
+	)
+
 	polMan, err = policyv2.NewPolicyManager(pol, users, nodes)
 	if err != nil {
 		return nil, err
@@ -48,8 +91,8 @@ func NewPolicyManager(pol []byte, users []types.User, nodes views.Slice[types.No
 	return polMan, err
 }
 
-// PolicyManagersForTest returns all available PostureManagers to be used
-// in tests to validate them in tests that try to determine that they
+// PolicyManagersForTest returns all available [PolicyManager] implementations to
+// be used in tests to validate them in tests that try to determine that they
 // behave the same.
 func PolicyManagersForTest(pol []byte, users []types.User, nodes views.Slice[types.NodeView]) ([]PolicyManager, error) {
 	var polMans []PolicyManager
@@ -59,6 +102,7 @@ func PolicyManagersForTest(pol []byte, users []types.User, nodes views.Slice[typ
 		if err != nil {
 			return nil, err
 		}
+
 		polMans = append(polMans, pm)
 	}
 
@@ -66,7 +110,7 @@ func PolicyManagersForTest(pol []byte, users []types.User, nodes views.Slice[typ
 }
 
 func PolicyManagerFuncsForTest(pol []byte) []func([]types.User, views.Slice[types.NodeView]) (PolicyManager, error) {
-	var polmanFuncs []func([]types.User, views.Slice[types.NodeView]) (PolicyManager, error)
+	polmanFuncs := make([]func([]types.User, views.Slice[types.NodeView]) (PolicyManager, error), 0, 1)
 
 	polmanFuncs = append(polmanFuncs, func(u []types.User, n views.Slice[types.NodeView]) (PolicyManager, error) {
 		return policyv2.NewPolicyManager(pol, u, n)

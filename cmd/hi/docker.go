@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cenkalti/backoff/v5"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
@@ -22,15 +23,20 @@ import (
 	"github.com/juanfont/headscale/integration/dockertestutil"
 )
 
+const defaultDirPerm = 0o755
+
 var (
 	ErrTestFailed              = errors.New("test failed")
 	ErrUnexpectedContainerWait = errors.New("unexpected end of container wait")
 	ErrNoDockerContext         = errors.New("no docker context found")
+	ErrMemoryLimitViolations   = errors.New("container(s) exceeded memory limits")
 )
 
 // runTestContainer executes integration tests in a Docker container.
+//
+//nolint:gocyclo // complex test orchestration function
 func runTestContainer(ctx context.Context, config *RunConfig) error {
-	cli, err := createDockerClient()
+	cli, err := createDockerClient(ctx)
 	if err != nil {
 		return fmt.Errorf("creating Docker client: %w", err)
 	}
@@ -52,7 +58,7 @@ func runTestContainer(ctx context.Context, config *RunConfig) error {
 	}
 
 	const dirPerm = 0o755
-	if err := os.MkdirAll(absLogsDir, dirPerm); err != nil {
+	if err := os.MkdirAll(absLogsDir, dirPerm); err != nil { //nolint:noinlineerr
 		return fmt.Errorf("creating logs directory: %w", err)
 	}
 
@@ -60,7 +66,9 @@ func runTestContainer(ctx context.Context, config *RunConfig) error {
 		if config.Verbose {
 			log.Printf("Running pre-test cleanup...")
 		}
-		if err := cleanupBeforeTest(ctx); err != nil && config.Verbose {
+
+		err := cleanupBeforeTest(ctx)
+		if err != nil && config.Verbose {
 			log.Printf("Warning: pre-test cleanup failed: %v", err)
 		}
 	}
@@ -71,7 +79,7 @@ func runTestContainer(ctx context.Context, config *RunConfig) error {
 	}
 
 	imageName := "golang:" + config.GoVersion
-	if err := ensureImageAvailable(ctx, cli, imageName, config.Verbose); err != nil {
+	if err := ensureImageAvailable(ctx, cli, imageName, config.Verbose); err != nil { //nolint:noinlineerr
 		return fmt.Errorf("ensuring image availability: %w", err)
 	}
 
@@ -84,7 +92,7 @@ func runTestContainer(ctx context.Context, config *RunConfig) error {
 		log.Printf("Created container: %s", resp.ID)
 	}
 
-	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil { //nolint:noinlineerr
 		return fmt.Errorf("starting container: %w", err)
 	}
 
@@ -95,13 +103,16 @@ func runTestContainer(ctx context.Context, config *RunConfig) error {
 
 	// Start stats collection for container resource monitoring (if enabled)
 	var statsCollector *StatsCollector
+
 	if config.Stats {
 		var err error
-		statsCollector, err = NewStatsCollector()
+
+		statsCollector, err = NewStatsCollector(ctx)
 		if err != nil {
 			if config.Verbose {
 				log.Printf("Warning: failed to create stats collector: %v", err)
 			}
+
 			statsCollector = nil
 		}
 
@@ -110,7 +121,8 @@ func runTestContainer(ctx context.Context, config *RunConfig) error {
 
 			// Start stats collection immediately - no need for complex retry logic
 			// The new implementation monitors Docker events and will catch containers as they start
-			if err := statsCollector.StartCollection(ctx, runID, config.Verbose); err != nil {
+			err := statsCollector.StartCollection(ctx, runID, config.Verbose)
+			if err != nil {
 				if config.Verbose {
 					log.Printf("Warning: failed to start stats collection: %v", err)
 				}
@@ -122,12 +134,13 @@ func runTestContainer(ctx context.Context, config *RunConfig) error {
 	exitCode, err := streamAndWait(ctx, cli, resp.ID)
 
 	// Ensure all containers have finished and logs are flushed before extracting artifacts
-	if waitErr := waitForContainerFinalization(ctx, cli, resp.ID, config.Verbose); waitErr != nil && config.Verbose {
+	waitErr := waitForContainerFinalization(ctx, cli, resp.ID, config.Verbose)
+	if waitErr != nil && config.Verbose {
 		log.Printf("Warning: failed to wait for container finalization: %v", waitErr)
 	}
 
 	// Extract artifacts from test containers before cleanup
-	if err := extractArtifactsFromContainers(ctx, resp.ID, logsDir, config.Verbose); err != nil && config.Verbose {
+	if err := extractArtifactsFromContainers(ctx, resp.ID, logsDir, config.Verbose); err != nil && config.Verbose { //nolint:noinlineerr
 		log.Printf("Warning: failed to extract artifacts from containers: %v", err)
 	}
 
@@ -140,12 +153,13 @@ func runTestContainer(ctx context.Context, config *RunConfig) error {
 		if len(violations) > 0 {
 			log.Printf("MEMORY LIMIT VIOLATIONS DETECTED:")
 			log.Printf("=================================")
+
 			for _, violation := range violations {
 				log.Printf("Container %s exceeded memory limit: %.1f MB > %.1f MB",
 					violation.ContainerName, violation.MaxMemoryMB, violation.LimitMB)
 			}
 
-			return fmt.Errorf("test failed: %d container(s) exceeded memory limits", len(violations))
+			return fmt.Errorf("test failed: %d %w", len(violations), ErrMemoryLimitViolations)
 		}
 	}
 
@@ -347,6 +361,7 @@ func waitForContainerFinalization(ctx context.Context, cli *client.Client, testC
 	maxWaitTime := 10 * time.Second
 	checkInterval := 500 * time.Millisecond
 	timeout := time.After(maxWaitTime)
+
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
 
@@ -356,6 +371,7 @@ func waitForContainerFinalization(ctx context.Context, cli *client.Client, testC
 			if verbose {
 				log.Printf("Timeout waiting for container finalization, proceeding with artifact extraction")
 			}
+
 			return nil
 		case <-ticker.C:
 			allFinalized := true
@@ -366,12 +382,14 @@ func waitForContainerFinalization(ctx context.Context, cli *client.Client, testC
 					if verbose {
 						log.Printf("Warning: failed to inspect container %s: %v", testCont.name, err)
 					}
+
 					continue
 				}
 
 				// Check if container is in a final state
 				if !isContainerFinalized(inspect.State) {
 					allFinalized = false
+
 					if verbose {
 						log.Printf("Container %s still finalizing (state: %s)", testCont.name, inspect.State.Status)
 					}
@@ -384,6 +402,7 @@ func waitForContainerFinalization(ctx context.Context, cli *client.Client, testC
 				if verbose {
 					log.Printf("All test containers finalized, ready for artifact extraction")
 				}
+
 				return nil
 			}
 		}
@@ -400,13 +419,15 @@ func isContainerFinalized(state *container.State) bool {
 func findProjectRoot(startPath string) string {
 	current := startPath
 	for {
-		if _, err := os.Stat(filepath.Join(current, "go.mod")); err == nil {
+		if _, err := os.Stat(filepath.Join(current, "go.mod")); err == nil { //nolint:noinlineerr
 			return current
 		}
+
 		parent := filepath.Dir(current)
 		if parent == current {
 			return startPath
 		}
+
 		current = parent
 	}
 }
@@ -416,6 +437,7 @@ func boolToInt(b bool) int {
 	if b {
 		return 1
 	}
+
 	return 0
 }
 
@@ -428,13 +450,14 @@ type DockerContext struct {
 }
 
 // createDockerClient creates a Docker client with context detection.
-func createDockerClient() (*client.Client, error) {
-	contextInfo, err := getCurrentDockerContext()
+func createDockerClient(ctx context.Context) (*client.Client, error) {
+	contextInfo, err := getCurrentDockerContext(ctx)
 	if err != nil {
 		return client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	}
 
 	var clientOpts []client.Opt
+
 	clientOpts = append(clientOpts, client.WithAPIVersionNegotiation())
 
 	if contextInfo != nil {
@@ -444,6 +467,7 @@ func createDockerClient() (*client.Client, error) {
 					if runConfig.Verbose {
 						log.Printf("Using Docker host from context '%s': %s", contextInfo.Name, host)
 					}
+
 					clientOpts = append(clientOpts, client.WithHost(host))
 				}
 			}
@@ -458,15 +482,16 @@ func createDockerClient() (*client.Client, error) {
 }
 
 // getCurrentDockerContext retrieves the current Docker context information.
-func getCurrentDockerContext() (*DockerContext, error) {
-	cmd := exec.Command("docker", "context", "inspect")
+func getCurrentDockerContext(ctx context.Context) (*DockerContext, error) {
+	cmd := exec.CommandContext(ctx, "docker", "context", "inspect")
+
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("getting docker context: %w", err)
 	}
 
 	var contexts []DockerContext
-	if err := json.Unmarshal(output, &contexts); err != nil {
+	if err := json.Unmarshal(output, &contexts); err != nil { //nolint:noinlineerr
 		return nil, fmt.Errorf("parsing docker context: %w", err)
 	}
 
@@ -486,20 +511,21 @@ func getDockerSocketPath() string {
 
 // checkImageAvailableLocally checks if the specified Docker image is available locally.
 func checkImageAvailableLocally(ctx context.Context, cli *client.Client, imageName string) (bool, error) {
-	_, _, err := cli.ImageInspectWithRaw(ctx, imageName)
+	_, _, err := cli.ImageInspectWithRaw(ctx, imageName) //nolint:staticcheck // SA1019: deprecated but functional
 	if err != nil {
-		if client.IsErrNotFound(err) {
+		if client.IsErrNotFound(err) { //nolint:staticcheck // SA1019: deprecated but functional
 			return false, nil
 		}
+
 		return false, fmt.Errorf("inspecting image %s: %w", imageName, err)
 	}
 
 	return true, nil
 }
 
-// ensureImageAvailable checks if the image is available locally first, then pulls if needed.
+// ensureImageAvailable pulls imageName if missing, using Docker Hub
+// credentials and retrying transient errors.
 func ensureImageAvailable(ctx context.Context, cli *client.Client, imageName string, verbose bool) error {
-	// First check if image is available locally
 	available, err := checkImageAvailableLocally(ctx, cli, imageName)
 	if err != nil {
 		return fmt.Errorf("checking local image availability: %w", err)
@@ -509,34 +535,66 @@ func ensureImageAvailable(ctx context.Context, cli *client.Client, imageName str
 		if verbose {
 			log.Printf("Image %s is available locally", imageName)
 		}
+
 		return nil
 	}
 
-	// Image not available locally, try to pull it
 	if verbose {
 		log.Printf("Image %s not found locally, pulling...", imageName)
 	}
 
-	reader, err := cli.ImagePull(ctx, imageName, image.PullOptions{})
+	registryAuth, err := dockertestutil.RegistryAuth()
 	if err != nil {
-		return fmt.Errorf("pulling image %s: %w", imageName, err)
+		return fmt.Errorf("resolving registry auth: %w", err)
 	}
-	defer reader.Close()
 
-	if verbose {
-		_, err = io.Copy(os.Stdout, reader)
-		if err != nil {
-			return fmt.Errorf("reading pull output: %w", err)
-		}
-	} else {
-		_, err = io.Copy(io.Discard, reader)
-		if err != nil {
-			return fmt.Errorf("reading pull output: %w", err)
-		}
+	_, err = backoff.Retry(
+		ctx,
+		func() (struct{}, error) {
+			reader, pullErr := cli.ImagePull(ctx, imageName, image.PullOptions{RegistryAuth: registryAuth})
+			if pullErr != nil {
+				if isPermanentDockerPullError(pullErr) {
+					return struct{}{}, backoff.Permanent(pullErr)
+				}
+
+				return struct{}{}, fmt.Errorf("pulling image %s: %w", imageName, pullErr)
+			}
+			defer reader.Close()
+
+			sink := io.Discard
+			if verbose {
+				sink = os.Stdout
+			}
+
+			_, copyErr := io.Copy(sink, reader)
+			if copyErr != nil {
+				return struct{}{}, fmt.Errorf("reading pull output: %w", copyErr)
+			}
+
+			return struct{}{}, nil
+		},
+		backoff.WithBackOff(backoff.NewExponentialBackOff()),
+		backoff.WithMaxElapsedTime(60*time.Second),
+	)
+	if err != nil {
+		return err
+	}
+
+	if !verbose {
 		log.Printf("Image %s pulled successfully", imageName)
 	}
 
 	return nil
+}
+
+func isPermanentDockerPullError(err error) bool {
+	msg := strings.ToLower(err.Error())
+
+	return strings.Contains(msg, "manifest unknown") ||
+		strings.Contains(msg, "manifest not found") ||
+		strings.Contains(msg, "repository does not exist") ||
+		strings.Contains(msg, "name unknown") ||
+		strings.Contains(msg, "no such image")
 }
 
 // listControlFiles displays the headscale test artifacts created in the control logs directory.
@@ -547,9 +605,11 @@ func listControlFiles(logsDir string) {
 		return
 	}
 
-	var logFiles []string
-	var dataFiles []string
-	var dataDirs []string
+	var (
+		logFiles  []string
+		dataFiles []string
+		dataDirs  []string
+	)
 
 	for _, entry := range entries {
 		name := entry.Name()
@@ -578,6 +638,7 @@ func listControlFiles(logsDir string) {
 
 	if len(logFiles) > 0 {
 		log.Printf("Headscale logs:")
+
 		for _, file := range logFiles {
 			log.Printf("  %s", file)
 		}
@@ -585,9 +646,11 @@ func listControlFiles(logsDir string) {
 
 	if len(dataFiles) > 0 || len(dataDirs) > 0 {
 		log.Printf("Headscale data:")
+
 		for _, file := range dataFiles {
 			log.Printf("  %s", file)
 		}
+
 		for _, dir := range dataDirs {
 			log.Printf("  %s/", dir)
 		}
@@ -596,7 +659,7 @@ func listControlFiles(logsDir string) {
 
 // extractArtifactsFromContainers collects container logs and files from the specific test run.
 func extractArtifactsFromContainers(ctx context.Context, testContainerID, logsDir string, verbose bool) error {
-	cli, err := createDockerClient()
+	cli, err := createDockerClient(ctx)
 	if err != nil {
 		return fmt.Errorf("creating Docker client: %w", err)
 	}
@@ -612,9 +675,11 @@ func extractArtifactsFromContainers(ctx context.Context, testContainerID, logsDi
 	currentTestContainers := getCurrentTestContainers(containers, testContainerID, verbose)
 
 	extractedCount := 0
+
 	for _, cont := range currentTestContainers {
 		// Extract container logs and tar files
-		if err := extractContainerArtifacts(ctx, cli, cont.ID, cont.name, logsDir, verbose); err != nil {
+		err := extractContainerArtifacts(ctx, cli, cont.ID, cont.name, logsDir, verbose)
+		if err != nil {
 			if verbose {
 				log.Printf("Warning: failed to extract artifacts from container %s (%s): %v", cont.name, cont.ID[:12], err)
 			}
@@ -622,6 +687,7 @@ func extractArtifactsFromContainers(ctx context.Context, testContainerID, logsDi
 			if verbose {
 				log.Printf("Extracted artifacts from container %s (%s)", cont.name, cont.ID[:12])
 			}
+
 			extractedCount++
 		}
 	}
@@ -645,11 +711,13 @@ func getCurrentTestContainers(containers []container.Summary, testContainerID st
 
 	// Find the test container to get its run ID label
 	var runID string
+
 	for _, cont := range containers {
 		if cont.ID == testContainerID {
 			if cont.Labels != nil {
 				runID = cont.Labels["hi.run-id"]
 			}
+
 			break
 		}
 	}
@@ -690,18 +758,21 @@ func getCurrentTestContainers(containers []container.Summary, testContainerID st
 // extractContainerArtifacts saves logs and tar files from a container.
 func extractContainerArtifacts(ctx context.Context, cli *client.Client, containerID, containerName, logsDir string, verbose bool) error {
 	// Ensure the logs directory exists
-	if err := os.MkdirAll(logsDir, 0o755); err != nil {
+	err := os.MkdirAll(logsDir, defaultDirPerm)
+	if err != nil {
 		return fmt.Errorf("creating logs directory: %w", err)
 	}
 
 	// Extract container logs
-	if err := extractContainerLogs(ctx, cli, containerID, containerName, logsDir, verbose); err != nil {
+	err = extractContainerLogs(ctx, cli, containerID, containerName, logsDir, verbose)
+	if err != nil {
 		return fmt.Errorf("extracting logs: %w", err)
 	}
 
 	// Extract tar files for headscale containers only
 	if strings.HasPrefix(containerName, "hs-") {
-		if err := extractContainerFiles(ctx, cli, containerID, containerName, logsDir, verbose); err != nil {
+		err := extractContainerFiles(ctx, cli, containerID, containerName, logsDir, verbose)
+		if err != nil {
 			if verbose {
 				log.Printf("Warning: failed to extract files from %s: %v", containerName, err)
 			}
@@ -741,12 +812,12 @@ func extractContainerLogs(ctx context.Context, cli *client.Client, containerID, 
 	}
 
 	// Write stdout logs
-	if err := os.WriteFile(stdoutPath, stdoutBuf.Bytes(), 0o644); err != nil {
+	if err := os.WriteFile(stdoutPath, stdoutBuf.Bytes(), 0o644); err != nil { //nolint:gosec,noinlineerr // log files should be readable
 		return fmt.Errorf("writing stdout log: %w", err)
 	}
 
 	// Write stderr logs
-	if err := os.WriteFile(stderrPath, stderrBuf.Bytes(), 0o644); err != nil {
+	if err := os.WriteFile(stderrPath, stderrBuf.Bytes(), 0o644); err != nil { //nolint:gosec,noinlineerr // log files should be readable
 		return fmt.Errorf("writing stderr log: %w", err)
 	}
 
@@ -759,7 +830,7 @@ func extractContainerLogs(ctx context.Context, cli *client.Client, containerID, 
 
 // extractContainerFiles extracts database file and directories from headscale containers.
 // Note: The actual file extraction is now handled by the integration tests themselves
-// via SaveProfile, SaveMapResponses, and SaveDatabase functions in hsic.go.
+// via [SaveProfile], [SaveMapResponses], and [SaveDatabase] functions in hsic.go.
 func extractContainerFiles(ctx context.Context, cli *client.Client, containerID, containerName, logsDir string, verbose bool) error {
 	// Files are now extracted directly by the integration tests
 	// This function is kept for potential future use or other file types

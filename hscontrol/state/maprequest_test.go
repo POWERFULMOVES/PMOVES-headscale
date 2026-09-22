@@ -1,15 +1,12 @@
 package state
 
 import (
-	"net/netip"
 	"testing"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
-	"tailscale.com/types/key"
-	"tailscale.com/types/ptr"
 )
 
 func TestNetInfoFromMapRequest(t *testing.T) {
@@ -78,7 +75,7 @@ func TestNetInfoPreservationInRegistrationFlow(t *testing.T) {
 	nodeID := types.NodeID(1)
 
 	// This test reproduces the bug in registration flows where NetInfo was lost
-	// because we used the wrong hostinfo reference when calling NetInfoFromMapRequest
+	// because we used the wrong hostinfo reference when calling [netInfoFromMapRequest]
 	t.Run("registration_flow_bug_reproduction", func(t *testing.T) {
 		// Simulate existing node with NetInfo (before re-registration)
 		existingNodeHostinfo := &tailcfg.Hostinfo{
@@ -135,27 +132,4 @@ func TestNetInfoPreservationInRegistrationFlow(t *testing.T) {
 		assert.NotNil(t, result, "New node for user2 should preserve NetInfo from user1's node")
 		assert.Equal(t, 7, result.PreferredDERP, "Should preserve DERP region from existing node")
 	})
-}
-
-// Simple helper function for tests
-func createTestNodeSimple(id types.NodeID) *types.Node {
-	user := types.User{
-		Name: "test-user",
-	}
-
-	machineKey := key.NewMachine()
-	nodeKey := key.NewNode()
-
-	node := &types.Node{
-		ID:         id,
-		Hostname:   "test-node",
-		UserID:     ptr.To(uint(id)),
-		User:       &user,
-		MachineKey: machineKey.Public(),
-		NodeKey:    nodeKey.Public(),
-		IPv4:       &netip.Addr{},
-		IPv6:       &netip.Addr{},
-	}
-
-	return node
 }

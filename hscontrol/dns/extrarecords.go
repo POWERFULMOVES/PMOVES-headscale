@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -14,6 +15,9 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/util/set"
 )
+
+// ErrPathIsDirectory is returned when a directory path is provided where a file is expected.
+var ErrPathIsDirectory = errors.New("path is a directory, only file is supported")
 
 type ExtraRecordsMan struct {
 	mu      sync.RWMutex
@@ -26,7 +30,7 @@ type ExtraRecordsMan struct {
 	hashes   map[string][32]byte
 }
 
-// NewExtraRecordsManager creates a new ExtraRecordsMan and starts watching the file at the given path.
+// NewExtraRecordsManager creates a new [ExtraRecordsMan] and starts watching the file at the given path.
 func NewExtraRecordsManager(path string) (*ExtraRecordsMan, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -39,7 +43,7 @@ func NewExtraRecordsManager(path string) (*ExtraRecordsMan, error) {
 	}
 
 	if fi.IsDir() {
-		return nil, fmt.Errorf("path is a directory, only file is supported: %s", path)
+		return nil, fmt.Errorf("%w: %s", ErrPathIsDirectory, path)
 	}
 
 	records, hash, err := readExtraRecordsFromPath(path)
@@ -85,19 +89,22 @@ func (e *ExtraRecordsMan) Run() {
 				log.Error().Caller().Msgf("file watcher event channel closing")
 				return
 			}
+
 			switch event.Op {
 			case fsnotify.Create, fsnotify.Write, fsnotify.Chmod:
 				log.Trace().Caller().Str("path", event.Name).Str("op", event.Op.String()).Msg("extra records received filewatch event")
+
 				if event.Name != e.path {
 					continue
 				}
+
 				e.updateRecords()
 
-				// If a file is removed or renamed, fsnotify will loose track of it
+				// If a file is removed or renamed, fsnotify will lose track of it
 				// and not watch it. We will therefore attempt to re-add it with a backoff.
 			case fsnotify.Remove, fsnotify.Rename:
 				_, err := backoff.Retry(context.Background(), func() (struct{}, error) {
-					if _, err := os.Stat(e.path); err != nil {
+					if _, err := os.Stat(e.path); err != nil { //nolint:noinlineerr
 						return struct{}{}, err
 					}
 
@@ -123,6 +130,7 @@ func (e *ExtraRecordsMan) Run() {
 				log.Error().Caller().Msgf("file watcher error channel closing")
 				return
 			}
+
 			log.Error().Caller().Err(err).Msgf("extra records filewatcher returned error: %q", err)
 		}
 	}
@@ -150,11 +158,12 @@ func (e *ExtraRecordsMan) updateRecords() {
 	}
 
 	e.mu.Lock()
-	defer e.mu.Unlock()
 
 	// If there has not been any change, ignore the update.
 	if oldHash, ok := e.hashes[e.path]; ok {
 		if newHash == oldHash {
+			e.mu.Unlock()
+
 			return
 		}
 	}
@@ -163,12 +172,22 @@ func (e *ExtraRecordsMan) updateRecords() {
 
 	e.records = set.SetOf(records)
 	e.hashes[e.path] = newHash
+	toSend := e.records.Slice()
 
 	log.Trace().Caller().Interface("records", e.records).Msgf("extra records updated from path, count old: %d, new: %d", oldCount, e.records.Len())
-	e.updateCh <- e.records.Slice()
+
+	// Release the lock before the (potentially blocking) send so a slow or
+	// absent consumer cannot stall Records() readers, and abort the send on
+	// shutdown instead of leaking this goroutine on the closed-down channel.
+	e.mu.Unlock()
+
+	select {
+	case e.updateCh <- toSend:
+	case <-e.closeCh:
+	}
 }
 
-// readExtraRecordsFromPath reads a JSON file of tailcfg.DNSRecord
+// readExtraRecordsFromPath reads a JSON file of [tailcfg.DNSRecord]
 // and returns the records and the hash of the file.
 func readExtraRecordsFromPath(path string) ([]tailcfg.DNSRecord, [32]byte, error) {
 	b, err := os.ReadFile(path)
@@ -183,6 +202,7 @@ func readExtraRecordsFromPath(path string) ([]tailcfg.DNSRecord, [32]byte, error
 	}
 
 	var records []tailcfg.DNSRecord
+
 	err = json.Unmarshal(b, &records)
 	if err != nil {
 		return nil, [32]byte{}, fmt.Errorf("unmarshalling records, content: %q: %w", string(b), err)

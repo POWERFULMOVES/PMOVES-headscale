@@ -17,7 +17,7 @@ func GenerateRandomBytes(n int) ([]byte, error) {
 	bytes := make([]byte, n)
 
 	// Note that err == nil only if we read len(b) bytes.
-	if _, err := rand.Read(bytes); err != nil {
+	if _, err := rand.Read(bytes); err != nil { //nolint:noinlineerr
 		return nil, err
 	}
 
@@ -32,8 +32,18 @@ func GenerateRandomBytes(n int) ([]byte, error) {
 func GenerateRandomStringURLSafe(n int) (string, error) {
 	b, err := GenerateRandomBytes(n)
 
-	uenc := base64.RawURLEncoding.EncodeToString(b)
-	return uenc[:n], err
+	return encodeRandomURLSafe(b, n, err)
+}
+
+// encodeRandomURLSafe URL-safe base64-encodes b and truncates to n. It checks
+// err first: on an RNG failure b is nil, so slicing the empty encoding would
+// panic instead of returning the ("", err) the caller is promised.
+func encodeRandomURLSafe(b []byte, n int, err error) (string, error) {
+	if err != nil {
+		return "", err
+	}
+
+	return base64.RawURLEncoding.EncodeToString(b)[:n], nil
 }
 
 // GenerateRandomStringDNSSafe returns a DNS-safe
@@ -42,13 +52,17 @@ func GenerateRandomStringURLSafe(n int) (string, error) {
 // number generator fails to function correctly, in which
 // case the caller should not continue.
 func GenerateRandomStringDNSSafe(size int) (string, error) {
-	var str string
-	var err error
+	var (
+		str string
+		err error
+	)
+
 	for len(str) < size {
 		str, err = GenerateRandomStringURLSafe(size)
 		if err != nil {
 			return "", err
 		}
+
 		str = strings.ToLower(
 			strings.ReplaceAll(strings.ReplaceAll(str, "_", ""), "-", ""),
 		)
@@ -64,11 +78,6 @@ func MustGenerateRandomStringDNSSafe(size int) string {
 	}
 
 	return hash
-}
-
-func InvalidString() string {
-	hash, _ := GenerateRandomStringDNSSafe(8)
-	return "invalid-" + hash
 }
 
 func TailNodesToString(nodes []*tailcfg.Node) string {
@@ -93,12 +102,13 @@ func TailcfgFilterRulesToString(rules []tailcfg.FilterRule) string {
 	var sb strings.Builder
 
 	for index, rule := range rules {
-		sb.WriteString(fmt.Sprintf(`
+		fmt.Fprintf(&sb, `
 {
   SrcIPs: %v
   DstIPs: %v
 }
-`, rule.SrcIPs, rule.DstPorts))
+`, rule.SrcIPs, rule.DstPorts)
+
 		if index < len(rules)-1 {
 			sb.WriteString(", ")
 		}

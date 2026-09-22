@@ -2,7 +2,12 @@
   description = "headscale - Open Source Tailscale Control server";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # Pinned to staging-next-26.05 for Go 1.26.4 (security fix GO-2026-5037/5039):
+    # nixpkgs-unstable still ships 1.26.3 — the bump is merged to nixpkgs staging
+    # but the large-rebuild staging->unstable pipeline lags. The 26.05 line is
+    # otherwise current (dev tools match unstable). Switch back to nixpkgs-unstable
+    # once it ships go_1_26 >= 1.26.4.
+    nixpkgs.url = "github:NixOS/nixpkgs/staging-next-26.05";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -26,8 +31,9 @@
       overlays.default = _: prev:
         let
           pkgs = nixpkgs.legacyPackages.${prev.stdenv.hostPlatform.system};
-          buildGo = pkgs.buildGo125Module;
-          vendorHash = "sha256-jkeB9XUTEGt58fPOMpE4/e3+JQoMQTgf0RlthVBmfG0=";
+          # Go 1.26 builder; resolves to Go 1.26.4 from the pinned nixpkgs.
+          buildGo = pkgs.buildGo126Module;
+          vendorHash = (builtins.fromJSON (builtins.readFile ./flakehashes.json)).vendor.sri;
         in
         {
           headscale = buildGo {
@@ -38,8 +44,8 @@
             # Only run unit tests when testing a build
             checkFlags = [ "-short" ];
 
-            # When updating go.mod or go.sum, a new sha will need to be calculated,
-            # update this if you have a mismatch after doing a change to those files.
+            # vendorHash is read from flakehashes.json; refresh via:
+            #   go run ./cmd/vendorhash update
             inherit vendorHash;
 
             subPackages = [ "cmd/headscale" ];
@@ -62,16 +68,16 @@
 
           protoc-gen-grpc-gateway = buildGo rec {
             pname = "grpc-gateway";
-            version = "2.27.7";
+            version = "2.29.0";
 
             src = pkgs.fetchFromGitHub {
               owner = "grpc-ecosystem";
               repo = "grpc-gateway";
               rev = "v${version}";
-              sha256 = "sha256-6R0EhNnOBEISJddjkbVTcBvUuU5U3r9Hu2UPfAZDep4=";
+              sha256 = "sha256-d9OIIGttyMBSNgpS6mbR5JEIm13qGu2gFHJazJAexdw=";
             };
 
-            vendorHash = "sha256-SOAbRrzMf2rbKaG9PGSnPSLY/qZVgbHcNjOLmVonycY=";
+            vendorHash = "sha256-p51yD+v8+rPs+ztlX7r0VQ4XlwUkxu+PxgknKEvH00k=";
 
             nativeBuildInputs = [ pkgs.installShellFiles ];
 
@@ -80,13 +86,13 @@
 
           protobuf-language-server = buildGo rec {
             pname = "protobuf-language-server";
-            version = "1cf777d";
+            version = "ab4c128";
 
             src = pkgs.fetchFromGitHub {
               owner = "lasorda";
               repo = "protobuf-language-server";
-              rev = "1cf777de4d35a6e493a689e3ca1a6183ce3206b6";
-              sha256 = "sha256-9MkBQPxr/TDr/sNz/Sk7eoZwZwzdVbE5u6RugXXk5iY=";
+              rev = "ab4c128f00774d51bd6d1f4cfa735f4b7c8619e3";
+              sha256 = "sha256-yF6kG+qTRxVO/qp2V9HgTyFBeOm5RQzeqdZFrdidwxM=";
             };
 
             vendorHash = "sha256-4nTpKBe7ekJsfQf+P6edT/9Vp2SBYbKz1ITawD3bhkI=";
@@ -94,19 +100,47 @@
             subPackages = [ "." ];
           };
 
-          # Upstream does not override buildGoModule properly,
-          # importing a specific module, so comment out for now.
-          # golangci-lint = prev.golangci-lint.override {
-          #   buildGoModule = buildGo;
-          # };
-          # golangci-lint-langserver = prev.golangci-lint.override {
-          #   buildGoModule = buildGo;
-          # };
+          # Build golangci-lint with stock Go 1.26 (upstream uses hardcoded Go
+          # version); it does not build against the pinned 1.26.4.
+          golangci-lint = buildGo rec {
+            pname = "golangci-lint";
+            version = "2.12.2";
 
-          # The package uses buildGo125Module, not the convention.
-          # goreleaser = prev.goreleaser.override {
-          #   buildGoModule = buildGo;
-          # };
+            src = pkgs.fetchFromGitHub {
+              owner = "golangci";
+              repo = "golangci-lint";
+              rev = "v${version}";
+              hash = "sha256-qR7fp1x2S+EwEAcplRHTvA3jWwLr/XSiYKSZtAwkrNU=";
+            };
+
+            vendorHash = "sha256-AG5wtLwWLz55bdp1oi3cW+9O3yj1W1P7MV9zxym7Pb4=";
+
+            subPackages = [ "cmd/golangci-lint" ];
+
+            nativeBuildInputs = [ pkgs.installShellFiles ];
+
+            ldflags = [
+              "-s"
+              "-w"
+              "-X main.version=${version}"
+              "-X main.commit=v${version}"
+              "-X main.date=1970-01-01T00:00:00Z"
+            ];
+
+            postInstall = ''
+              for shell in bash zsh fish; do
+                HOME=$TMPDIR $out/bin/golangci-lint completion $shell > golangci-lint.$shell
+                installShellCompletion golangci-lint.$shell
+              done
+            '';
+
+            meta = {
+              description = "Fast linters runner for Go";
+              homepage = "https://golangci-lint.run/";
+              changelog = "https://github.com/golangci/golangci-lint/blob/v${version}/CHANGELOG.md";
+              mainProgram = "golangci-lint";
+            };
+          };
 
           gotestsum = prev.gotestsum.override {
             buildGoModule = buildGo;
@@ -120,9 +154,9 @@
             buildGoModule = buildGo;
           };
 
-          # gopls = prev.gopls.override {
-          #   buildGoModule = buildGo;
-          # };
+          gopls = prev.gopls.override {
+            buildGoLatestModule = buildGo;
+          };
         };
     }
     // flake-utils.lib.eachDefaultSystem
@@ -132,14 +166,14 @@
           overlays = [ self.overlays.default ];
           inherit system;
         };
-        buildDeps = with pkgs; [ git go_1_25 gnumake ];
+        buildDeps = with pkgs; [ git go_1_26 gnumake ];
         devDeps = with pkgs;
           buildDeps
           ++ [
             golangci-lint
             golangci-lint-langserver
             golines
-            nodePackages.prettier
+            prettier
             nixpkgs-fmt
             goreleaser
             nfpm
@@ -152,6 +186,10 @@
             yq-go
             ripgrep
             postgresql
+            python314Packages.mdformat
+            python314Packages.mdformat-footnote
+            python314Packages.mdformat-frontmatter
+            python314Packages.mdformat-mkdocs
             prek
 
             # 'dot' is needed for pprof graphs
@@ -167,7 +205,7 @@
             clang-tools # clang-format
             protobuf-language-server
           ]
-          ++ lib.optional pkgs.stdenv.isLinux [ traceroute ];
+          ++ lib.optionals pkgs.stdenv.isLinux [ traceroute ];
 
         # Add entry to build a docker image with headscale
         # caveat: only works on Linux
@@ -192,19 +230,13 @@
                 "nix-vendor-sri"
                 ''
                   set -eu
-
-                  OUT=$(mktemp -d -t nar-hash-XXXXXX)
-                  rm -rf "$OUT"
-
-                  go mod vendor -o "$OUT"
-                  go run tailscale.com/cmd/nardump --sri "$OUT"
-                  rm -rf "$OUT"
+                  exec go run ./cmd/vendorhash update "$@"
                 '')
 
               (pkgs.writeShellScriptBin
                 "go-mod-update-all"
                 ''
-                  cat go.mod | ${pkgs.silver-searcher}/bin/ag "\t" | ${pkgs.silver-searcher}/bin/ag -v indirect | ${pkgs.gawk}/bin/awk '{print $1}' | ${pkgs.findutils}/bin/xargs go get -u
+                  cat go.mod | ${pkgs.ripgrep}/bin/rg "\t" | ${pkgs.ripgrep}/bin/rg -v indirect | ${pkgs.gawk}/bin/awk '{print $1}' | ${pkgs.findutils}/bin/xargs go get -u
                   go mod tidy
                 '')
             ];

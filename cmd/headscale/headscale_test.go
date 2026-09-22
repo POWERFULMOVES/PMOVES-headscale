@@ -14,9 +14,7 @@ import (
 )
 
 func TestConfigFileLoading(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "headscale")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	path, err := os.Getwd()
 	require.NoError(t, err)
@@ -48,9 +46,7 @@ func TestConfigFileLoading(t *testing.T) {
 }
 
 func TestConfigLoading(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "headscale")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	path, err := os.Getwd()
 	require.NoError(t, err)
@@ -77,5 +73,4 @@ func TestConfigLoading(t *testing.T) {
 	assert.Equal(t, "HTTP-01", viper.GetString("tls_letsencrypt_challenge_type"))
 	assert.Equal(t, fs.FileMode(0o770), util.GetFileMode("unix_socket_permission"))
 	assert.False(t, viper.GetBool("logtail.enabled"))
-	assert.False(t, viper.GetBool("randomize_client_port"))
 }

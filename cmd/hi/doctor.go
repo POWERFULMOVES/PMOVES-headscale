@@ -7,6 +7,20 @@ import (
 	"log"
 	"os/exec"
 	"strings"
+
+	"github.com/juanfont/headscale/integration/dockertestutil"
+)
+
+const (
+	statusPass = "PASS"
+	statusFail = "FAIL"
+	statusWarn = "WARN"
+
+	nameDockerDaemon  = "Docker Daemon"
+	nameDockerContext = "Docker Context"
+	nameDockerSocket  = "Docker Socket"
+	nameGolangImage   = "Golang Image"
+	nameGoInstall     = "Go Installation"
 )
 
 var ErrSystemChecksFailed = errors.New("system checks failed")
@@ -31,27 +45,28 @@ func runDoctorCheck(ctx context.Context) error {
 	results = append(results, dockerResult)
 
 	// If Docker is available, run additional checks
-	if dockerResult.Status == "PASS" {
+	if dockerResult.Status == statusPass {
 		results = append(results, checkDockerContext(ctx))
 		results = append(results, checkDockerSocket(ctx))
+		results = append(results, checkDockerHubCredentials())
 		results = append(results, checkGolangImage(ctx))
 	}
 
 	// Check 3: Go installation
-	results = append(results, checkGoInstallation())
+	results = append(results, checkGoInstallation(ctx))
 
 	// Check 4: Git repository
-	results = append(results, checkGitRepository())
+	results = append(results, checkGitRepository(ctx))
 
 	// Check 5: Required files
-	results = append(results, checkRequiredFiles())
+	results = append(results, checkRequiredFiles(ctx))
 
 	// Display results
 	displayDoctorResults(results)
 
 	// Return error if any critical checks failed
 	for _, result := range results {
-		if result.Status == "FAIL" {
+		if result.Status == statusFail {
 			return fmt.Errorf("%w - see details above", ErrSystemChecksFailed)
 		}
 	}
@@ -67,7 +82,7 @@ func checkDockerBinary() DoctorResult {
 	if err != nil {
 		return DoctorResult{
 			Name:    "Docker Binary",
-			Status:  "FAIL",
+			Status:  statusFail,
 			Message: "Docker binary not found in PATH",
 			Suggestions: []string{
 				"Install Docker: https://docs.docker.com/get-docker/",
@@ -79,18 +94,18 @@ func checkDockerBinary() DoctorResult {
 
 	return DoctorResult{
 		Name:    "Docker Binary",
-		Status:  "PASS",
+		Status:  statusPass,
 		Message: "Docker binary found",
 	}
 }
 
 // checkDockerDaemon verifies Docker daemon is running and accessible.
 func checkDockerDaemon(ctx context.Context) DoctorResult {
-	cli, err := createDockerClient()
+	cli, err := createDockerClient(ctx)
 	if err != nil {
 		return DoctorResult{
-			Name:    "Docker Daemon",
-			Status:  "FAIL",
+			Name:    nameDockerDaemon,
+			Status:  statusFail,
 			Message: fmt.Sprintf("Cannot create Docker client: %v", err),
 			Suggestions: []string{
 				"Start Docker daemon/service",
@@ -105,8 +120,8 @@ func checkDockerDaemon(ctx context.Context) DoctorResult {
 	_, err = cli.Ping(ctx)
 	if err != nil {
 		return DoctorResult{
-			Name:    "Docker Daemon",
-			Status:  "FAIL",
+			Name:    nameDockerDaemon,
+			Status:  statusFail,
 			Message: fmt.Sprintf("Cannot ping Docker daemon: %v", err),
 			Suggestions: []string{
 				"Ensure Docker daemon is running",
@@ -117,19 +132,19 @@ func checkDockerDaemon(ctx context.Context) DoctorResult {
 	}
 
 	return DoctorResult{
-		Name:    "Docker Daemon",
-		Status:  "PASS",
+		Name:    nameDockerDaemon,
+		Status:  statusPass,
 		Message: "Docker daemon is running and accessible",
 	}
 }
 
 // checkDockerContext verifies Docker context configuration.
-func checkDockerContext(_ context.Context) DoctorResult {
-	contextInfo, err := getCurrentDockerContext()
+func checkDockerContext(ctx context.Context) DoctorResult {
+	contextInfo, err := getCurrentDockerContext(ctx)
 	if err != nil {
 		return DoctorResult{
-			Name:    "Docker Context",
-			Status:  "WARN",
+			Name:    nameDockerContext,
+			Status:  statusWarn,
 			Message: "Could not detect Docker context, using default settings",
 			Suggestions: []string{
 				"Check: docker context ls",
@@ -140,26 +155,26 @@ func checkDockerContext(_ context.Context) DoctorResult {
 
 	if contextInfo == nil {
 		return DoctorResult{
-			Name:    "Docker Context",
-			Status:  "PASS",
+			Name:    nameDockerContext,
+			Status:  statusPass,
 			Message: "Using default Docker context",
 		}
 	}
 
 	return DoctorResult{
-		Name:    "Docker Context",
-		Status:  "PASS",
+		Name:    nameDockerContext,
+		Status:  statusPass,
 		Message: "Using Docker context: " + contextInfo.Name,
 	}
 }
 
 // checkDockerSocket verifies Docker socket accessibility.
 func checkDockerSocket(ctx context.Context) DoctorResult {
-	cli, err := createDockerClient()
+	cli, err := createDockerClient(ctx)
 	if err != nil {
 		return DoctorResult{
-			Name:    "Docker Socket",
-			Status:  "FAIL",
+			Name:    nameDockerSocket,
+			Status:  statusFail,
 			Message: fmt.Sprintf("Cannot access Docker socket: %v", err),
 			Suggestions: []string{
 				"Check Docker socket permissions",
@@ -173,8 +188,8 @@ func checkDockerSocket(ctx context.Context) DoctorResult {
 	info, err := cli.Info(ctx)
 	if err != nil {
 		return DoctorResult{
-			Name:    "Docker Socket",
-			Status:  "FAIL",
+			Name:    nameDockerSocket,
+			Status:  statusFail,
 			Message: fmt.Sprintf("Cannot get Docker info: %v", err),
 			Suggestions: []string{
 				"Check Docker daemon status",
@@ -184,19 +199,43 @@ func checkDockerSocket(ctx context.Context) DoctorResult {
 	}
 
 	return DoctorResult{
-		Name:    "Docker Socket",
-		Status:  "PASS",
+		Name:    nameDockerSocket,
+		Status:  statusPass,
 		Message: fmt.Sprintf("Docker socket accessible (Server: %s)", info.ServerVersion),
+	}
+}
+
+// checkDockerHubCredentials warns when pulls would be anonymous and
+// therefore rate-limited.
+func checkDockerHubCredentials() DoctorResult {
+	_, _, source := dockertestutil.Credentials()
+	if source == dockertestutil.CredentialSourceAnonymous {
+		return DoctorResult{
+			Name:    "Docker Hub Credentials",
+			Status:  "WARN",
+			Message: "No Docker Hub credentials found — pulls will be rate-limited (100/6h per IP)",
+			Suggestions: []string{
+				"Run: docker login",
+				"Or export DOCKERHUB_USERNAME and DOCKERHUB_TOKEN",
+				"In CI: ensure the docker/login-action step is configured with secrets",
+			},
+		}
+	}
+
+	return DoctorResult{
+		Name:    "Docker Hub Credentials",
+		Status:  "PASS",
+		Message: fmt.Sprintf("Credentials available (source: %s)", source),
 	}
 }
 
 // checkGolangImage verifies the golang Docker image is available locally or can be pulled.
 func checkGolangImage(ctx context.Context) DoctorResult {
-	cli, err := createDockerClient()
+	cli, err := createDockerClient(ctx)
 	if err != nil {
 		return DoctorResult{
-			Name:    "Golang Image",
-			Status:  "FAIL",
+			Name:    nameGolangImage,
+			Status:  statusFail,
 			Message: "Cannot create Docker client for image check",
 		}
 	}
@@ -209,8 +248,8 @@ func checkGolangImage(ctx context.Context) DoctorResult {
 	available, err := checkImageAvailableLocally(ctx, cli, imageName)
 	if err != nil {
 		return DoctorResult{
-			Name:    "Golang Image",
-			Status:  "FAIL",
+			Name:    nameGolangImage,
+			Status:  statusFail,
 			Message: fmt.Sprintf("Cannot check golang image %s: %v", imageName, err),
 			Suggestions: []string{
 				"Check Docker daemon status",
@@ -221,8 +260,8 @@ func checkGolangImage(ctx context.Context) DoctorResult {
 
 	if available {
 		return DoctorResult{
-			Name:    "Golang Image",
-			Status:  "PASS",
+			Name:    nameGolangImage,
+			Status:  statusPass,
 			Message: fmt.Sprintf("Golang image %s is available locally", imageName),
 		}
 	}
@@ -231,8 +270,8 @@ func checkGolangImage(ctx context.Context) DoctorResult {
 	err = ensureImageAvailable(ctx, cli, imageName, false)
 	if err != nil {
 		return DoctorResult{
-			Name:    "Golang Image",
-			Status:  "FAIL",
+			Name:    nameGolangImage,
+			Status:  statusFail,
 			Message: fmt.Sprintf("Golang image %s not available locally and cannot pull: %v", imageName, err),
 			Suggestions: []string{
 				"Check internet connectivity",
@@ -244,19 +283,19 @@ func checkGolangImage(ctx context.Context) DoctorResult {
 	}
 
 	return DoctorResult{
-		Name:    "Golang Image",
-		Status:  "PASS",
+		Name:    nameGolangImage,
+		Status:  statusPass,
 		Message: fmt.Sprintf("Golang image %s is now available", imageName),
 	}
 }
 
 // checkGoInstallation verifies Go is installed and working.
-func checkGoInstallation() DoctorResult {
+func checkGoInstallation(ctx context.Context) DoctorResult {
 	_, err := exec.LookPath("go")
 	if err != nil {
 		return DoctorResult{
-			Name:    "Go Installation",
-			Status:  "FAIL",
+			Name:    nameGoInstall,
+			Status:  statusFail,
 			Message: "Go binary not found in PATH",
 			Suggestions: []string{
 				"Install Go: https://golang.org/dl/",
@@ -265,12 +304,13 @@ func checkGoInstallation() DoctorResult {
 		}
 	}
 
-	cmd := exec.Command("go", "version")
+	cmd := exec.CommandContext(ctx, "go", "version")
+
 	output, err := cmd.Output()
 	if err != nil {
 		return DoctorResult{
-			Name:    "Go Installation",
-			Status:  "FAIL",
+			Name:    nameGoInstall,
+			Status:  statusFail,
 			Message: fmt.Sprintf("Cannot get Go version: %v", err),
 		}
 	}
@@ -278,20 +318,21 @@ func checkGoInstallation() DoctorResult {
 	version := strings.TrimSpace(string(output))
 
 	return DoctorResult{
-		Name:    "Go Installation",
-		Status:  "PASS",
+		Name:    nameGoInstall,
+		Status:  statusPass,
 		Message: version,
 	}
 }
 
 // checkGitRepository verifies we're in a git repository.
-func checkGitRepository() DoctorResult {
-	cmd := exec.Command("git", "rev-parse", "--git-dir")
+func checkGitRepository(ctx context.Context) DoctorResult {
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--git-dir")
+
 	err := cmd.Run()
 	if err != nil {
 		return DoctorResult{
 			Name:    "Git Repository",
-			Status:  "FAIL",
+			Status:  statusFail,
 			Message: "Not in a Git repository",
 			Suggestions: []string{
 				"Run from within the headscale git repository",
@@ -302,13 +343,13 @@ func checkGitRepository() DoctorResult {
 
 	return DoctorResult{
 		Name:    "Git Repository",
-		Status:  "PASS",
+		Status:  statusPass,
 		Message: "Running in Git repository",
 	}
 }
 
 // checkRequiredFiles verifies required files exist.
-func checkRequiredFiles() DoctorResult {
+func checkRequiredFiles(ctx context.Context) DoctorResult {
 	requiredFiles := []string{
 		"go.mod",
 		"integration/",
@@ -316,9 +357,12 @@ func checkRequiredFiles() DoctorResult {
 	}
 
 	var missingFiles []string
+
 	for _, file := range requiredFiles {
-		cmd := exec.Command("test", "-e", file)
-		if err := cmd.Run(); err != nil {
+		cmd := exec.CommandContext(ctx, "test", "-e", file)
+
+		err := cmd.Run()
+		if err != nil {
 			missingFiles = append(missingFiles, file)
 		}
 	}
@@ -326,7 +370,7 @@ func checkRequiredFiles() DoctorResult {
 	if len(missingFiles) > 0 {
 		return DoctorResult{
 			Name:    "Required Files",
-			Status:  "FAIL",
+			Status:  statusFail,
 			Message: "Missing required files: " + strings.Join(missingFiles, ", "),
 			Suggestions: []string{
 				"Ensure you're in the headscale project root directory",
@@ -338,7 +382,7 @@ func checkRequiredFiles() DoctorResult {
 
 	return DoctorResult{
 		Name:    "Required Files",
-		Status:  "PASS",
+		Status:  statusPass,
 		Message: "All required files found",
 	}
 }
@@ -350,12 +394,13 @@ func displayDoctorResults(results []DoctorResult) {
 
 	for _, result := range results {
 		var icon string
+
 		switch result.Status {
-		case "PASS":
+		case statusPass:
 			icon = "✅"
-		case "WARN":
+		case statusWarn:
 			icon = "⚠️"
-		case "FAIL":
+		case statusFail:
 			icon = "❌"
 		default:
 			icon = "❓"

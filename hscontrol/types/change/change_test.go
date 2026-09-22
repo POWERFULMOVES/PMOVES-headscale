@@ -1,11 +1,13 @@
 package change
 
 import (
+	"net/netip"
 	"reflect"
 	"testing"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 )
 
@@ -16,8 +18,8 @@ func TestChange_FieldSync(t *testing.T) {
 	typ := reflect.TypeFor[Change]()
 	boolCount := 0
 
-	for i := range typ.NumField() {
-		if typ.Field(i).Type.Kind() == reflect.Bool {
+	for field := range typ.Fields() {
+		if field.Type.Kind() == reflect.Bool {
 			boolCount++
 		}
 	}
@@ -87,6 +89,11 @@ func TestChange_IsEmpty(t *testing.T) {
 		{
 			name:     "PeerPatches not empty",
 			response: Change{PeerPatches: []*tailcfg.PeerChange{{}}},
+			want:     false,
+		},
+		{
+			name:     "PingRequest not empty",
+			response: Change{PingRequest: &tailcfg.PingRequest{URL: "https://example.com"}},
 			want:     false,
 		},
 	}
@@ -263,11 +270,122 @@ func TestChange_Merge(t *testing.T) {
 			r2:   Change{TargetNode: 42},
 			want: Change{TargetNode: 42, IncludeSelf: true},
 		},
+		{
+			name: "PingRequest preserved from first",
+			r1:   Change{PingRequest: &tailcfg.PingRequest{URL: "first"}},
+			r2:   Change{IncludeSelf: true},
+			want: Change{PingRequest: &tailcfg.PingRequest{URL: "first"}, IncludeSelf: true},
+		},
+		{
+			name: "PingRequest preserved from second when first is nil",
+			r1:   Change{IncludeSelf: true},
+			r2:   Change{PingRequest: &tailcfg.PingRequest{URL: "second"}},
+			want: Change{PingRequest: &tailcfg.PingRequest{URL: "second"}, IncludeSelf: true},
+		},
+		{
+			name: "PingRequest first wins when both set",
+			r1:   Change{PingRequest: &tailcfg.PingRequest{URL: "first"}},
+			r2:   Change{PingRequest: &tailcfg.PingRequest{URL: "second"}},
+			want: Change{PingRequest: &tailcfg.PingRequest{URL: "first"}},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := tt.r1.Merge(tt.r2)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestChange_IsBroadcastPolicyChange(t *testing.T) {
+	originUpdate := PolicyChange()
+	originUpdate.OriginNode = 7
+
+	targeted := PolicyChange()
+	targeted.TargetNode = 7
+
+	tests := []struct {
+		name string
+		c    Change
+		want bool
+	}{
+		{name: "policy change", c: PolicyChange(), want: true},
+		{name: "self-update recompute", c: originUpdate, want: false},
+		{name: "targeted recompute", c: targeted, want: false},
+		{name: "online patch", c: NodeOnline(1), want: false},
+		{name: "full update", c: FullUpdate(), want: false},
+		{name: "derp map", c: DERPMap(), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.c.IsBroadcastPolicyChange())
+		})
+	}
+}
+
+func TestDedupePolicyChanges(t *testing.T) {
+	// originRecompute is a runtime recompute carrying node-specific payload
+	// (OriginNode), so it is not the canonical broadcast PolicyChange and must
+	// never be coalesced away.
+	originRecompute := PolicyChange()
+	originRecompute.OriginNode = 7
+
+	tests := []struct {
+		name    string
+		changes []Change
+		want    []Change
+	}{
+		{
+			name:    "nil is a no-op",
+			changes: nil,
+			want:    nil,
+		},
+		{
+			name:    "single policy change is unchanged",
+			changes: []Change{PolicyChange()},
+			want:    []Change{PolicyChange()},
+		},
+		{
+			name:    "identical policy changes collapse to one",
+			changes: []Change{PolicyChange(), PolicyChange(), PolicyChange()},
+			want:    []Change{PolicyChange()},
+		},
+		{
+			name: "peer patches survive between collapsed policy changes",
+			changes: []Change{
+				NodeOnline(1), PolicyChange(), NodeOnline(2), PolicyChange(), NodeOffline(3),
+			},
+			want: []Change{
+				NodeOnline(1), PolicyChange(), NodeOnline(2), NodeOffline(3),
+			},
+		},
+		{
+			name:    "NodeAdded is preserved, not treated as a recompute",
+			changes: []Change{PolicyChange(), NodeAdded(5), PolicyChange()},
+			want:    []Change{PolicyChange(), NodeAdded(5)},
+		},
+		{
+			name:    "recompute carrying OriginNode is kept alongside the canonical one",
+			changes: []Change{PolicyChange(), originRecompute, PolicyChange()},
+			want:    []Change{PolicyChange(), originRecompute},
+		},
+		{
+			name:    "non-canonical recomputes are not collapsed",
+			changes: []Change{originRecompute, originRecompute},
+			want:    []Change{originRecompute, originRecompute},
+		},
+		{
+			name:    "changes without any recompute are unchanged",
+			changes: []Change{NodeOnline(1), DERPMap()},
+			want:    []Change{NodeOnline(1), DERPMap()},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := DedupePolicyChanges(tt.changes)
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -418,6 +536,14 @@ func TestChange_Type(t *testing.T) {
 			want:     "config",
 		},
 		{
+			name: "ping request",
+			response: Change{
+				PingRequest: &tailcfg.PingRequest{URL: "https://example.com"},
+				TargetNode:  1,
+			},
+			want: "ping",
+		},
+		{
 			name:     "empty is unknown",
 			response: Change{},
 			want:     "unknown",
@@ -430,6 +556,17 @@ func TestChange_Type(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestPingNode(t *testing.T) {
+	pr := &tailcfg.PingRequest{URL: "https://example.com/ping", URLIsNoise: true, Log: true}
+	r := PingNode(42, pr)
+	assert.Equal(t, "ping node", r.Reason)
+	assert.Equal(t, types.NodeID(42), r.TargetNode)
+	assert.Equal(t, pr, r.PingRequest)
+	assert.True(t, r.IsTargetedToNode())
+	assert.False(t, r.IsEmpty())
+	assert.Equal(t, "ping", r.Type())
 }
 
 func TestUniqueNodeIDs(t *testing.T) {
@@ -474,6 +611,45 @@ func TestUniqueNodeIDs(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := uniqueNodeIDs(tt.input)
 			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestNodeOnlineOfflineForSubnetRouter(t *testing.T) {
+	route := netip.MustParsePrefix("10.0.0.0/24")
+	router := types.Node{
+		ID:             1,
+		Hostinfo:       &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}},
+		ApprovedRoutes: []netip.Prefix{route},
+	}
+	view := router.View()
+	require.True(t, view.IsSubnetRouter(), "test node must be a subnet router")
+
+	tests := []struct {
+		name       string
+		got        Change
+		wantOnline bool
+	}{
+		{name: "online", got: NodeOnlineFor(view), wantOnline: true},
+		{name: "offline", got: NodeOfflineFor(view), wantOnline: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// A subnet router's online/offline transition rides the lightweight
+			// peer patch, not a full update: the gated PolicyChange that
+			// State.Connect/Disconnect emit owns the netmap recompute.
+			assert.False(t, tt.got.IsFull(),
+				"subnet router online/offline must be a peer patch, not a full update")
+
+			require.NotEmpty(t, tt.got.PeerPatches,
+				"expected an online/offline peer patch")
+
+			patch := tt.got.PeerPatches[0]
+			assert.Equal(t, view.ID().NodeID(), patch.NodeID)
+
+			require.NotNil(t, patch.Online)
+			assert.Equal(t, tt.wantOnline, *patch.Online)
 		})
 	}
 }

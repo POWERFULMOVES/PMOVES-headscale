@@ -3,10 +3,17 @@ package db
 import (
 	"context"
 	"encoding"
+	"errors"
 	"fmt"
 	"reflect"
 
 	"gorm.io/gorm/schema"
+)
+
+var (
+	errUnmarshalTextValue = errors.New("unmarshalling text value")
+	errUnsupportedType    = errors.New("unsupported type")
+	errTextMarshalerOnly  = errors.New("only encoding.TextMarshaler is supported")
 )
 
 // Got from https://github.com/xdg-go/strum/blob/main/types.go
@@ -17,7 +24,7 @@ func isTextUnmarshaler(rv reflect.Value) bool {
 }
 
 func maybeInstantiatePtr(rv reflect.Value) {
-	if rv.Kind() == reflect.Ptr && rv.IsNil() {
+	if rv.Kind() == reflect.Pointer && rv.IsNil() {
 		np := reflect.New(rv.Type().Elem())
 		rv.Set(np)
 	}
@@ -27,8 +34,8 @@ func decodingError(name string, err error) error {
 	return fmt.Errorf("decoding to %s: %w", name, err)
 }
 
-// TextSerialiser implements the Serialiser interface for fields that
-// have a type that implements encoding.TextUnmarshaler.
+// TextSerialiser implements the [schema.SerializerInterface] for fields that
+// have a type that implements [encoding.TextUnmarshaler].
 type TextSerialiser struct{}
 
 func (TextSerialiser) Scan(ctx context.Context, field *schema.Field, dst reflect.Value, dbValue any) error {
@@ -36,28 +43,32 @@ func (TextSerialiser) Scan(ctx context.Context, field *schema.Field, dst reflect
 
 	// If the field is a pointer, we need to dereference it to get the actual type
 	// so we do not end with a second pointer.
-	if fieldValue.Elem().Kind() == reflect.Ptr {
+	if fieldValue.Elem().Kind() == reflect.Pointer {
 		fieldValue = fieldValue.Elem()
 	}
 
 	if dbValue != nil {
 		var bytes []byte
+
 		switch v := dbValue.(type) {
 		case []byte:
 			bytes = v
 		case string:
 			bytes = []byte(v)
 		default:
-			return fmt.Errorf("unmarshalling text value: %#v", dbValue)
+			return fmt.Errorf("%w: %#v", errUnmarshalTextValue, dbValue)
 		}
 
 		if isTextUnmarshaler(fieldValue) {
 			maybeInstantiatePtr(fieldValue)
 			f := fieldValue.MethodByName("UnmarshalText")
 			args := []reflect.Value{reflect.ValueOf(bytes)}
+
 			ret := f.Call(args)
 			if !ret[0].IsNil() {
-				return decodingError(field.Name, ret[0].Interface().(error))
+				if err, ok := ret[0].Interface().(error); ok {
+					return decodingError(field.Name, err)
+				}
 			}
 
 			// If the underlying field is to a pointer type, we need to
@@ -65,7 +76,7 @@ func (TextSerialiser) Scan(ctx context.Context, field *schema.Field, dst reflect
 			// If it is not a pointer, we need to assign the value to the
 			// field.
 			dstField := field.ReflectValueOf(ctx, dst)
-			if dstField.Kind() == reflect.Ptr {
+			if dstField.Kind() == reflect.Pointer {
 				dstField.Set(fieldValue)
 			} else {
 				dstField.Set(fieldValue.Elem())
@@ -73,7 +84,7 @@ func (TextSerialiser) Scan(ctx context.Context, field *schema.Field, dst reflect
 
 			return nil
 		} else {
-			return fmt.Errorf("unsupported type: %T", fieldValue.Interface())
+			return fmt.Errorf("%w: %T", errUnsupportedType, fieldValue.Interface())
 		}
 	}
 
@@ -86,9 +97,10 @@ func (TextSerialiser) Value(ctx context.Context, field *schema.Field, dst reflec
 		// If the value is nil, we return nil, however, go nil values are not
 		// always comparable, particularly when reflection is involved:
 		// https://dev.to/arxeiss/in-go-nil-is-not-equal-to-nil-sometimes-jn8
-		if v == nil || (reflect.ValueOf(v).Kind() == reflect.Ptr && reflect.ValueOf(v).IsNil()) {
-			return nil, nil
+		if v == nil || (reflect.ValueOf(v).Kind() == reflect.Pointer && reflect.ValueOf(v).IsNil()) {
+			return nil, nil //nolint:nilnil // intentional: nil value for GORM serializer
 		}
+
 		b, err := v.MarshalText()
 		if err != nil {
 			return nil, err
@@ -96,6 +108,6 @@ func (TextSerialiser) Value(ctx context.Context, field *schema.Field, dst reflec
 
 		return string(b), nil
 	default:
-		return nil, fmt.Errorf("only encoding.TextMarshaler is supported, got %t", v)
+		return nil, fmt.Errorf("%w, got %T", errTextMarshalerOnly, v)
 	}
 }

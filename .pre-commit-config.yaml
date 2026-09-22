@@ -13,6 +13,7 @@ repos:
     rev: v6.0.0
     hooks:
       - id: check-added-large-files
+        args: [--maxkb=1024]
       - id: check-case-conflict
       - id: check-executables-have-shebangs
       - id: check-json
@@ -43,26 +44,28 @@ repos:
         entry: prettier --write --list-different
         language: system
         exclude: ^docs/
-        types_or:
-          [
-            javascript,
-            jsx,
-            ts,
-            tsx,
-            yaml,
-            json,
-            toml,
-            html,
-            css,
-            scss,
-            sass,
-            markdown,
-          ]
+        types_or: [javascript, jsx, ts, tsx, yaml, json, toml, html, css, scss, sass, markdown]
+
+      # mdformat for docs
+      - id: mdformat
+        name: mdformat
+        entry: mdformat
+        language: system
+        types_or: [markdown]
+        files: ^docs/
 
       # golangci-lint for Go code quality
       - id: golangci-lint
         name: golangci-lint
-        entry: nix develop --command golangci-lint run --new-from-rev=HEAD~1 --timeout=5m --fix
+        entry: nix develop --command -- golangci-lint run --new-from-rev=HEAD~1 --timeout=5m --fix
         language: system
         types: [go]
+        pass_filenames: false
+
+      # vendor-hash keeps flakehashes.json in sync with go.mod/go.sum.
+      - id: vendor-hash
+        name: vendor-hash
+        entry: nix develop --command -- go run ./cmd/vendorhash check
+        language: system
+        files: ^(go\.mod|go\.sum|flakehashes\.json)$
         pass_filenames: false

@@ -1,19 +1,18 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
-	"zgo.at/zcache/v2"
 )
 
 // TestSQLiteMigrationAndDataValidation tests specific SQLite migration scenarios
@@ -44,6 +43,7 @@ func TestSQLiteMigrationAndDataValidation(t *testing.T) {
 
 				// Verify api_keys data preservation
 				var apiKeyCount int
+
 				err = hsdb.DB.Raw("SELECT COUNT(*) FROM api_keys").Scan(&apiKeyCount).Error
 				require.NoError(t, err)
 				assert.Equal(t, 2, apiKeyCount, "should preserve all 2 api_keys from original schema")
@@ -122,7 +122,7 @@ func TestSQLiteMigrationAndDataValidation(t *testing.T) {
 				// Expected: tags = ["tag:server"] (no duplicates)
 				node4 := findNode("node4")
 				require.NotNil(t, node4, "node4 should exist")
-				assert.Equal(t, []string{"tag:server"}, node4.Tags, "node4 should have tag:server without duplicates")
+				assert.Equal(t, []string{"tag:server"}, node4.Tags.List(), "node4 should have tag:server without duplicates") //nolint:goconst // descriptive test assertions read better with the literal inline
 
 				// Node 5: user2 has no RequestTags
 				// Expected: tags = [] (unchanged)
@@ -144,6 +144,60 @@ func TestSQLiteMigrationAndDataValidation(t *testing.T) {
 				assert.NotContains(t, node7.Tags, "tag:forbidden", "node7 should NOT have tag:forbidden (unauthorized)")
 			},
 		},
+		// Test for the zero-time node expiry migration
+		// (202605221435-clear-zero-time-node-expiry). Pre-0.28 versions
+		// stored a zero time.Time as '0001-01-01 00:00:00+00:00' rather
+		// than NULL, which caused 0.29 to report those nodes as expired.
+		// Fixes: https://github.com/juanfont/headscale/issues/3284
+		{
+			dbPath: "testdata/sqlite/zero_time_expiry_migration_test.sql",
+			wantFunc: func(t *testing.T, hsdb *HSDatabase) {
+				t.Helper()
+
+				nodes, err := Read(hsdb.DB, func(rx *gorm.DB) (types.Nodes, error) {
+					return ListNodes(rx)
+				})
+				require.NoError(t, err)
+				require.Len(t, nodes, 5, "should have all 5 nodes")
+
+				byHostname := make(map[string]*types.Node, len(nodes))
+				for _, n := range nodes {
+					byHostname[n.Hostname] = n
+				}
+
+				// Node 1 had a zero-time expiry; should be cleared.
+				node1 := byHostname["node1"]
+				require.NotNil(t, node1, "node1 should exist")
+				assert.Nil(t, node1.Expiry, "node1 zero-time expiry should be cleared to NULL")
+				assert.False(t, node1.IsExpired(), "node1 should not be reported as expired")
+
+				// Node 2 already had NULL expiry; should still be NULL.
+				node2 := byHostname["node2"]
+				require.NotNil(t, node2, "node2 should exist")
+				assert.Nil(t, node2.Expiry, "node2 NULL expiry should be preserved")
+				assert.False(t, node2.IsExpired(), "node2 should not be reported as expired")
+
+				// Node 3 had a real future expiry; should be preserved.
+				node3 := byHostname["node3"]
+				require.NotNil(t, node3, "node3 should exist")
+				require.NotNil(t, node3.Expiry, "node3 future expiry should be preserved")
+				assert.Equal(t, 2099, node3.Expiry.UTC().Year(), "node3 expiry year should be 2099")
+				assert.False(t, node3.IsExpired(), "node3 with future expiry should not be expired")
+
+				// Node 4 had a real past expiry; should be preserved.
+				node4 := byHostname["node4"]
+				require.NotNil(t, node4, "node4 should exist")
+				require.NotNil(t, node4.Expiry, "node4 past expiry should be preserved")
+				assert.Equal(t, 2020, node4.Expiry.UTC().Year(), "node4 expiry year should be 2020")
+				assert.True(t, node4.IsExpired(), "node4 with past expiry should still be expired")
+
+				// Node 5 also had a zero-time expiry; should be cleared.
+				node5 := byHostname["node5"]
+				require.NotNil(t, node5, "node5 should exist")
+				assert.Nil(t, node5.Expiry, "node5 zero-time expiry should be cleared to NULL")
+				assert.False(t, node5.IsExpired(), "node5 should not be reported as expired")
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -160,10 +214,6 @@ func TestSQLiteMigrationAndDataValidation(t *testing.T) {
 	}
 }
 
-func emptyCache() *zcache.Cache[types.RegistrationID, types.RegisterNode] {
-	return zcache.New[types.RegistrationID, types.RegisterNode](time.Minute, time.Hour)
-}
-
 func createSQLiteFromSQLFile(sqlFilePath, dbPath string) error {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -176,7 +226,7 @@ func createSQLiteFromSQLFile(sqlFilePath, dbPath string) error {
 		return err
 	}
 
-	_, err = db.Exec(string(schemaContent))
+	_, err = db.ExecContext(context.Background(), string(schemaContent))
 
 	return err
 }
@@ -186,6 +236,7 @@ func createSQLiteFromSQLFile(sqlFilePath, dbPath string) error {
 func requireConstraintFailed(t *testing.T, err error) {
 	t.Helper()
 	require.Error(t, err)
+
 	if !strings.Contains(err.Error(), "UNIQUE constraint failed:") && !strings.Contains(err.Error(), "violates unique constraint") {
 		require.Failf(t, "expected error to contain a constraint failure, got: %s", err.Error())
 	}
@@ -198,7 +249,7 @@ func TestConstraints(t *testing.T) {
 	}{
 		{
 			name: "no-duplicate-username-if-no-oidc",
-			run: func(t *testing.T, db *gorm.DB) {
+			run: func(t *testing.T, db *gorm.DB) { //nolint:thelper
 				_, err := CreateUser(db, types.User{Name: "user1"})
 				require.NoError(t, err)
 				_, err = CreateUser(db, types.User{Name: "user1"})
@@ -207,7 +258,7 @@ func TestConstraints(t *testing.T) {
 		},
 		{
 			name: "no-oidc-duplicate-username-and-id",
-			run: func(t *testing.T, db *gorm.DB) {
+			run: func(t *testing.T, db *gorm.DB) { //nolint:thelper
 				user := types.User{
 					Model: gorm.Model{ID: 1},
 					Name:  "user1",
@@ -229,7 +280,7 @@ func TestConstraints(t *testing.T) {
 		},
 		{
 			name: "no-oidc-duplicate-id",
-			run: func(t *testing.T, db *gorm.DB) {
+			run: func(t *testing.T, db *gorm.DB) { //nolint:thelper
 				user := types.User{
 					Model: gorm.Model{ID: 1},
 					Name:  "user1",
@@ -251,7 +302,7 @@ func TestConstraints(t *testing.T) {
 		},
 		{
 			name: "allow-duplicate-username-cli-then-oidc",
-			run: func(t *testing.T, db *gorm.DB) {
+			run: func(t *testing.T, db *gorm.DB) { //nolint:thelper
 				_, err := CreateUser(db, types.User{Name: "user1"}) // Create CLI username
 				require.NoError(t, err)
 
@@ -266,7 +317,7 @@ func TestConstraints(t *testing.T) {
 		},
 		{
 			name: "allow-duplicate-username-oidc-then-cli",
-			run: func(t *testing.T, db *gorm.DB) {
+			run: func(t *testing.T, db *gorm.DB) { //nolint:thelper
 				user := types.User{
 					Name:               "user1",
 					ProviderIdentifier: sql.NullString{String: "http://test.com/user1", Valid: true},
@@ -320,7 +371,7 @@ func TestPostgresMigrationAndDataValidation(t *testing.T) {
 			}
 
 			// Construct the pg_restore command
-			cmd := exec.Command(pgRestorePath, "--verbose", "--if-exists", "--clean", "--no-owner", "--dbname", u.String(), tt.dbPath)
+			cmd := exec.CommandContext(context.Background(), pgRestorePath, "--verbose", "--if-exists", "--clean", "--no-owner", "--dbname", u.String(), tt.dbPath)
 
 			// Set the output streams
 			cmd.Stdout = os.Stdout
@@ -376,7 +427,6 @@ func dbForTestWithPath(t *testing.T, sqlFilePath string) *HSDatabase {
 				Mode: types.PolicyModeDB,
 			},
 		},
-		emptyCache(),
 	)
 	if err != nil {
 		t.Fatalf("setting up database: %s", err)
@@ -401,6 +451,7 @@ func dbForTestWithPath(t *testing.T, sqlFilePath string) *HSDatabase {
 // skip already-applied migrations and only run new ones.
 func TestSQLiteAllTestdataMigrations(t *testing.T) {
 	t.Parallel()
+
 	schemas, err := os.ReadDir("testdata/sqlite")
 	require.NoError(t, err)
 
@@ -435,7 +486,6 @@ func TestSQLiteAllTestdataMigrations(t *testing.T) {
 						Mode: types.PolicyModeDB,
 					},
 				},
-				emptyCache(),
 			)
 			require.NoError(t, err)
 		})

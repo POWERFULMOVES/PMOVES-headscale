@@ -3,22 +3,24 @@ package mapper
 import (
 	"encoding/json"
 	"net/netip"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/juanfont/headscale/hscontrol/routes"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
-	"tailscale.com/types/ptr"
 )
 
 func TestTailNode(t *testing.T) {
+	t.Parallel()
+
 	mustNK := func(str string) key.NodePublic {
 		var k key.NodePublic
+
 		_ = k.UnmarshalText([]byte(str))
 
 		return k
@@ -26,6 +28,7 @@ func TestTailNode(t *testing.T) {
 
 	mustDK := func(str string) key.DiscoPublic {
 		var k key.DiscoPublic
+
 		_ = k.UnmarshalText([]byte(str))
 
 		return k
@@ -33,6 +36,7 @@ func TestTailNode(t *testing.T) {
 
 	mustMK := func(str string) key.MachinePublic {
 		var k key.MachinePublic
+
 		_ = k.UnmarshalText([]byte(str))
 
 		return k
@@ -49,7 +53,6 @@ func TestTailNode(t *testing.T) {
 	tests := []struct {
 		name       string
 		node       *types.Node
-		pol        []byte
 		dnsConfig  *tailcfg.DNSConfig
 		baseDomain string
 		want       *tailcfg.Node
@@ -67,14 +70,14 @@ func TestTailNode(t *testing.T) {
 				Name:              "empty",
 				StableID:          "0",
 				HomeDERP:          0,
-				LegacyDERPString:  "127.3.3.40:0",
 				Hostinfo:          hiview(tailcfg.Hostinfo{}),
 				MachineAuthorized: true,
 
 				CapMap: tailcfg.NodeCapMap{
-					tailcfg.CapabilityFileSharing: []tailcfg.RawMessage{},
-					tailcfg.CapabilityAdmin:       []tailcfg.RawMessage{},
-					tailcfg.CapabilitySSH:         []tailcfg.RawMessage{},
+					tailcfg.CapabilityAdmin:           []tailcfg.RawMessage{},
+					tailcfg.CapabilitySSH:             []tailcfg.RawMessage{},
+					tailcfg.CapabilityFileSharing:     []tailcfg.RawMessage{},
+					tailcfg.NodeAttrDefaultAutoUpdate: []tailcfg.RawMessage{tailcfg.RawMessage("false")},
 				},
 			},
 			wantErr: false,
@@ -95,7 +98,7 @@ func TestTailNode(t *testing.T) {
 				IPv4:      iap("100.64.0.1"),
 				Hostname:  "mini",
 				GivenName: "mini",
-				UserID:    ptr.To(uint(0)),
+				UserID:    new(uint(0)),
 				User: &types.User{
 					Name: "mini",
 				},
@@ -137,15 +140,14 @@ func TestTailNode(t *testing.T) {
 				Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
 				AllowedIPs: []netip.Prefix{
 					tsaddr.AllIPv4(),
-					netip.MustParsePrefix("192.168.0.0/24"),
 					netip.MustParsePrefix("100.64.0.1/32"),
+					netip.MustParsePrefix("192.168.0.0/24"),
 					tsaddr.AllIPv6(),
 				},
 				PrimaryRoutes: []netip.Prefix{
 					netip.MustParsePrefix("192.168.0.0/24"),
 				},
-				HomeDERP:         0,
-				LegacyDERPString: "127.3.3.40:0",
+				HomeDERP: 0,
 				Hostinfo: hiview(tailcfg.Hostinfo{
 					RoutableIPs: []netip.Prefix{
 						tsaddr.AllIPv4(),
@@ -161,9 +163,10 @@ func TestTailNode(t *testing.T) {
 				MachineAuthorized: true,
 
 				CapMap: tailcfg.NodeCapMap{
-					tailcfg.CapabilityFileSharing: []tailcfg.RawMessage{},
-					tailcfg.CapabilityAdmin:       []tailcfg.RawMessage{},
-					tailcfg.CapabilitySSH:         []tailcfg.RawMessage{},
+					tailcfg.CapabilityAdmin:           []tailcfg.RawMessage{},
+					tailcfg.CapabilitySSH:             []tailcfg.RawMessage{},
+					tailcfg.CapabilityFileSharing:     []tailcfg.RawMessage{},
+					tailcfg.NodeAttrDefaultAutoUpdate: []tailcfg.RawMessage{tailcfg.RawMessage("false")},
 				},
 			},
 			wantErr: false,
@@ -181,14 +184,14 @@ func TestTailNode(t *testing.T) {
 				Name:              "minimal.example.com.",
 				StableID:          "0",
 				HomeDERP:          0,
-				LegacyDERPString:  "127.3.3.40:0",
 				Hostinfo:          hiview(tailcfg.Hostinfo{}),
 				MachineAuthorized: true,
 
 				CapMap: tailcfg.NodeCapMap{
-					tailcfg.CapabilityFileSharing: []tailcfg.RawMessage{},
-					tailcfg.CapabilityAdmin:       []tailcfg.RawMessage{},
-					tailcfg.CapabilitySSH:         []tailcfg.RawMessage{},
+					tailcfg.CapabilityAdmin:           []tailcfg.RawMessage{},
+					tailcfg.CapabilitySSH:             []tailcfg.RawMessage{},
+					tailcfg.CapabilityFileSharing:     []tailcfg.RawMessage{},
+					tailcfg.NodeAttrDefaultAutoUpdate: []tailcfg.RawMessage{tailcfg.RawMessage("false")},
 				},
 			},
 			wantErr: false,
@@ -200,24 +203,34 @@ func TestTailNode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			primary := routes.New()
-			cfg := &types.Config{
-				BaseDomain:          tt.baseDomain,
-				TailcfgDNSConfig:    tt.dnsConfig,
-				RandomizeClientPort: false,
-				Taildrop:            types.TaildropConfig{Enabled: true},
-			}
-			_ = primary.SetRoutes(tt.node.ID, tt.node.SubnetRoutes()...)
+			t.Parallel()
 
-			// This is a hack to avoid having a second node to test the primary route.
-			// This should be baked into the test case proper if it is extended in the future.
-			_ = primary.SetRoutes(2, netip.MustParsePrefix("192.168.0.0/24"))
-			got, err := tt.node.View().TailNode(
+			cfg := &types.Config{
+				BaseDomain:       tt.baseDomain,
+				TailcfgDNSConfig: tt.dnsConfig,
+				Taildrop:         types.TaildropConfig{Enabled: true},
+			}
+
+			// Stub primary-route lookup: tt.node owns its SubnetRoutes,
+			// node ID 2 owns 192.168.0.0/24 (a hack carried over from
+			// the original routes-package-driven version of this test —
+			// avoids spinning up a second node just to validate that
+			// other nodes' primaries don't leak into tt.node's TailNode
+			// output).
+			primaries := map[types.NodeID][]netip.Prefix{
+				tt.node.ID: tt.node.SubnetRoutes(),
+				2:          {netip.MustParsePrefix("192.168.0.0/24")},
+			}
+			nv := tt.node.View()
+			got, err := nv.TailNode(
 				0,
 				func(id types.NodeID) []netip.Prefix {
-					return primary.PrimaryRoutes(id)
+					// Route function returns primaries + exit routes
+					// (matching the real caller contract).
+					return slices.Concat(primaries[id], nv.ExitRoutes())
 				},
 				cfg,
+				nil,
 			)
 
 			if (err != nil) != tt.wantErr {
@@ -228,6 +241,208 @@ func TestTailNode(t *testing.T) {
 
 			if diff := cmp.Diff(tt.want, got, cmpopts.EquateEmpty()); diff != "" {
 				t.Errorf("TailNode() unexpected result (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestTailNodeBaselineGates focuses on the cfg-driven baseline cap
+// emission: cfg.Taildrop.Enabled gates [tailcfg.CapabilityFileSharing]
+// and cfg.AutoUpdate.Enabled controls the value of
+// [tailcfg.NodeAttrDefaultAutoUpdate]. Admin and SSH are unconditional
+// baseline.
+func TestTailNodeBaselineGates(t *testing.T) {
+	t.Parallel()
+
+	autoUpdate := func(b bool) []tailcfg.RawMessage {
+		if b {
+			return []tailcfg.RawMessage{tailcfg.RawMessage("true")}
+		}
+
+		return []tailcfg.RawMessage{tailcfg.RawMessage("false")}
+	}
+
+	tests := []struct {
+		name string
+		cfg  *types.Config
+		want tailcfg.NodeCapMap
+	}{
+		{
+			name: "taildrop_on_autoupdate_off",
+			cfg: &types.Config{
+				Taildrop:   types.TaildropConfig{Enabled: true},
+				AutoUpdate: types.AutoUpdateConfig{Enabled: false},
+			},
+			want: tailcfg.NodeCapMap{
+				tailcfg.CapabilityAdmin:           []tailcfg.RawMessage{},
+				tailcfg.CapabilitySSH:             []tailcfg.RawMessage{},
+				tailcfg.CapabilityFileSharing:     []tailcfg.RawMessage{},
+				tailcfg.NodeAttrDefaultAutoUpdate: autoUpdate(false),
+			},
+		},
+		{
+			name: "taildrop_off_autoupdate_off",
+			cfg: &types.Config{
+				Taildrop:   types.TaildropConfig{Enabled: false},
+				AutoUpdate: types.AutoUpdateConfig{Enabled: false},
+			},
+			want: tailcfg.NodeCapMap{
+				tailcfg.CapabilityAdmin:           []tailcfg.RawMessage{},
+				tailcfg.CapabilitySSH:             []tailcfg.RawMessage{},
+				tailcfg.NodeAttrDefaultAutoUpdate: autoUpdate(false),
+			},
+		},
+		{
+			name: "taildrop_on_autoupdate_on",
+			cfg: &types.Config{
+				Taildrop:   types.TaildropConfig{Enabled: true},
+				AutoUpdate: types.AutoUpdateConfig{Enabled: true},
+			},
+			want: tailcfg.NodeCapMap{
+				tailcfg.CapabilityAdmin:           []tailcfg.RawMessage{},
+				tailcfg.CapabilitySSH:             []tailcfg.RawMessage{},
+				tailcfg.CapabilityFileSharing:     []tailcfg.RawMessage{},
+				tailcfg.NodeAttrDefaultAutoUpdate: autoUpdate(true),
+			},
+		},
+		{
+			name: "taildrop_off_autoupdate_on",
+			cfg: &types.Config{
+				Taildrop:   types.TaildropConfig{Enabled: false},
+				AutoUpdate: types.AutoUpdateConfig{Enabled: true},
+			},
+			want: tailcfg.NodeCapMap{
+				tailcfg.CapabilityAdmin:           []tailcfg.RawMessage{},
+				tailcfg.CapabilitySSH:             []tailcfg.RawMessage{},
+				tailcfg.NodeAttrDefaultAutoUpdate: autoUpdate(true),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			node := &types.Node{GivenName: "baseline-node", Hostinfo: &tailcfg.Hostinfo{}}
+
+			got, err := node.View().TailNode(
+				0,
+				func(types.NodeID) []netip.Prefix { return nil },
+				tt.cfg,
+				nil,
+			)
+			if err != nil {
+				t.Fatalf("TailNode: %v", err)
+			}
+
+			if diff := cmp.Diff(tt.want, got.CapMap, cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("CapMap mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestTailNodeDisableIPv4 asserts that a node with the disable-ipv4
+// nodeAttr has its own IPv4 (the CGNAT /32) stripped from Addresses
+// and AllowedIPs, while subnet routes the node advertises -- even
+// IPv4 ones -- remain in AllowedIPs and PrimaryRoutes. Matches the
+// SaaS behaviour captured in
+// hscontrol/policy/v2/testdata/nodeattrs_results/nodeattrs-attr-c1{5,6}-disable-ipv4*.hujson.
+func TestTailNodeDisableIPv4(t *testing.T) {
+	t.Parallel()
+
+	const NodeAttrDisableIPv4 tailcfg.NodeCapability = "disable-ipv4"
+
+	v4 := iap("100.64.0.1")
+	v6Addr := netip.MustParseAddr("fd7a:115c:a1e0::1")
+	v6 := &v6Addr
+	subnet := netip.MustParsePrefix("10.33.0.0/16")
+
+	tests := []struct {
+		name        string
+		hasCap      bool
+		approved    []netip.Prefix
+		wantAllowed []netip.Prefix
+		wantPrimary []netip.Prefix
+		wantAddrs   []netip.Prefix
+	}{
+		{
+			name:        "no-cap_emits_both_families",
+			hasCap:      false,
+			wantAllowed: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32"), netip.MustParsePrefix("fd7a:115c:a1e0::1/128")},
+			wantAddrs:   []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32"), netip.MustParsePrefix("fd7a:115c:a1e0::1/128")},
+		},
+		{
+			name:        "cap_strips_own_ipv4",
+			hasCap:      true,
+			wantAllowed: []netip.Prefix{netip.MustParsePrefix("fd7a:115c:a1e0::1/128")},
+			wantAddrs:   []netip.Prefix{netip.MustParsePrefix("fd7a:115c:a1e0::1/128")},
+		},
+		{
+			name:     "cap_keeps_advertised_subnet_route",
+			hasCap:   true,
+			approved: []netip.Prefix{subnet},
+			// AllowedIPs is sorted by netip.Prefix.Compare so IPv4
+			// sorts before IPv6.
+			wantAllowed: []netip.Prefix{
+				subnet,
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+			},
+			wantPrimary: []netip.Prefix{subnet},
+			wantAddrs:   []netip.Prefix{netip.MustParsePrefix("fd7a:115c:a1e0::1/128")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			node := &types.Node{
+				GivenName: "ipv4-disabled-node",
+				IPv4:      v4,
+				IPv6:      v6,
+				Hostinfo: &tailcfg.Hostinfo{
+					RoutableIPs: tt.approved,
+				},
+				ApprovedRoutes: tt.approved,
+			}
+
+			var selfCaps tailcfg.NodeCapMap
+			if tt.hasCap {
+				selfCaps = tailcfg.NodeCapMap{NodeAttrDisableIPv4: nil}
+			}
+
+			got, err := node.View().TailNode(
+				0,
+				func(types.NodeID) []netip.Prefix {
+					return tt.approved
+				},
+				&types.Config{Taildrop: types.TaildropConfig{Enabled: true}},
+				selfCaps,
+			)
+			if err != nil {
+				t.Fatalf("TailNode: %v", err)
+			}
+
+			prefStrings := func(ps []netip.Prefix) []string {
+				out := make([]string, len(ps))
+				for i, p := range ps {
+					out[i] = p.String()
+				}
+
+				return out
+			}
+
+			if diff := cmp.Diff(prefStrings(tt.wantAddrs), prefStrings(got.Addresses), cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("Addresses (-want +got):\n%s", diff)
+			}
+
+			if diff := cmp.Diff(prefStrings(tt.wantAllowed), prefStrings(got.AllowedIPs), cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("AllowedIPs (-want +got):\n%s", diff)
+			}
+
+			if diff := cmp.Diff(prefStrings(tt.wantPrimary), prefStrings(got.PrimaryRoutes), cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("PrimaryRoutes (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -255,7 +470,7 @@ func TestNodeExpiry(t *testing.T) {
 		},
 		{
 			name:         "localtime",
-			exp:          tp(time.Time{}.Local()),
+			exp:          tp(time.Time{}.Local()), //nolint:gosmopolitan
 			wantTimeZero: true,
 		},
 	}
@@ -274,6 +489,7 @@ func TestNodeExpiry(t *testing.T) {
 					return []netip.Prefix{}
 				},
 				&types.Config{Taildrop: types.TaildropConfig{Enabled: true}},
+				nil,
 			)
 			if err != nil {
 				t.Fatalf("nodeExpiry() error = %v", err)
@@ -284,7 +500,9 @@ func TestNodeExpiry(t *testing.T) {
 			if err != nil {
 				t.Fatalf("nodeExpiry() error = %v", err)
 			}
+
 			var deseri tailcfg.Node
+
 			err = json.Unmarshal(seri, &deseri)
 			if err != nil {
 				t.Fatalf("nodeExpiry() error = %v", err)

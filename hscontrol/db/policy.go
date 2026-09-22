@@ -17,7 +17,8 @@ func (hsdb *HSDatabase) SetPolicy(policy string) (*types.Policy, error) {
 		Data: policy,
 	}
 
-	if err := hsdb.DB.Clauses(clause.Returning{}).Create(&p).Error; err != nil {
+	err := hsdb.DB.Clauses(clause.Returning{}).Create(&p).Error
+	if err != nil {
 		return nil, err
 	}
 
@@ -30,7 +31,7 @@ func (hsdb *HSDatabase) GetPolicy() (*types.Policy, error) {
 }
 
 // GetPolicy returns the latest policy from the database.
-// This standalone function can be used in contexts where HSDatabase is not available,
+// This standalone function can be used in contexts where [HSDatabase] is not available,
 // such as during migrations.
 func GetPolicy(tx *gorm.DB) (*types.Policy, error) {
 	var p types.Policy
@@ -54,7 +55,7 @@ func GetPolicy(tx *gorm.DB) (*types.Policy, error) {
 
 // PolicyBytes loads policy configuration from file or database based on the configured mode.
 // Returns nil if no policy is configured, which is valid.
-// This standalone function can be used in contexts where HSDatabase is not available,
+// This standalone function can be used in contexts where [HSDatabase] is not available,
 // such as during migrations.
 func PolicyBytes(tx *gorm.DB, cfg *types.Config) ([]byte, error) {
 	switch cfg.Policy.Mode {

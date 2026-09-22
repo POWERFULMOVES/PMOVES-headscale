@@ -30,6 +30,13 @@ func main() {
 				},
 			},
 			{
+				Name:     "list-versions",
+				Help:     "Print Tailscale versions used by integration tests",
+				Usage:    "list-versions [flags]",
+				SetFlags: command.Flags(flax.MustBind, &listVersionsConfig),
+				Run:      listVersions,
+			},
+			{
 				Name: "clean",
 				Help: "Clean Docker resources",
 				Commands: []*command.C{
@@ -79,13 +86,18 @@ func main() {
 }
 
 func cleanAll(ctx context.Context) error {
-	if err := killTestContainers(ctx); err != nil {
+	err := killTestContainers(ctx)
+	if err != nil {
 		return err
 	}
-	if err := pruneDockerNetworks(ctx); err != nil {
+
+	err = pruneDockerNetworks(ctx)
+	if err != nil {
 		return err
 	}
-	if err := cleanOldImages(ctx); err != nil {
+
+	err = cleanOldImages(ctx)
+	if err != nil {
 		return err
 	}
 
